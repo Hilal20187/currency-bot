@@ -1,17 +1,10 @@
 import os
-import json
-import time
 import asyncio
 import logging
 import requests
 
 from telegram import Update
-from telegram.error import (
-    Conflict,
-    NetworkError,
-    TimedOut,
-    RetryAfter,
-)
+from telegram.error import Conflict, NetworkError, TimedOut, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -26,12 +19,14 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
 
+# تحديث كل 3 ساعات
 UPDATE_INTERVAL = 3 * 60 * 60
+
+# أول تحديث بعد 10 ثواني
 FIRST_UPDATE = 10
 
+# JSON exchange-rate API
 API_URL = "https://api.exchangerate.dev/v1/latest/USD"
-
-CACHE_FILE = "last_rate.json"
 
 
 # ============================================================
@@ -47,76 +42,22 @@ logger = logging.getLogger("LEX")
 
 
 # ============================================================
-# HTTP
+# GET RATE
 # ============================================================
 
-session = requests.Session()
+def get_rate_sync():
 
-session.headers.update({
-    "User-Agent": "LEX-Currency-Bot/5.0",
-    "Accept": "application/json",
-})
-
-
-# ============================================================
-# CACHE
-# ============================================================
-
-def save_cache(usd_eur, eur_usd):
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "usd_eur": usd_eur,
-                    "eur_usd": eur_usd,
-                    "saved_at": int(time.time()),
-                },
-                f,
-            )
-    except Exception as e:
-        logger.warning("Cache save failed: %s", e)
-
-
-def load_cache():
-    try:
-        if not os.path.exists(CACHE_FILE):
-            return None
-
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        usd_eur = float(data["usd_eur"])
-        eur_usd = float(data["eur_usd"])
-        saved_at = int(data["saved_at"])
-
-        if usd_eur <= 0 or eur_usd <= 0:
-            return None
-
-        return usd_eur, eur_usd, saved_at
-
-    except Exception:
-        return None
-
-
-# ============================================================
-# RATE
-# ============================================================
-
-def get_live_rate_sync():
-
-    logger.info("🌐 Requesting live USD/EUR...")
-
-    response = session.get(
+    response = requests.get(
         API_URL,
-        params={"symbols": "EUR"},
+        params={
+            "symbols": "EUR",
+        },
         timeout=(5, 15),
     )
 
     response.raise_for_status()
 
     data = response.json()
-
-    logger.info("API response received")
 
     if data.get("error"):
         raise RuntimeError(
@@ -126,39 +67,28 @@ def get_live_rate_sync():
     rates = data.get("rates")
 
     if not isinstance(rates, dict):
-        raise RuntimeError(
-            "Invalid API response"
-        )
+        raise RuntimeError("Invalid API response")
 
     if "EUR" not in rates:
-        raise RuntimeError(
-            "EUR rate missing"
-        )
+        raise RuntimeError("EUR rate missing")
 
     usd_eur = float(rates["EUR"])
 
-    if not (0.1 < usd_eur < 2.0):
+    # حماية من رقم غير منطقي
+    if not 0.1 < usd_eur < 2:
         raise RuntimeError(
             f"Invalid USD/EUR rate: {usd_eur}"
         )
 
     eur_usd = 1 / usd_eur
 
-    save_cache(
-        usd_eur,
-        eur_usd,
-    )
-
     logger.info(
-        "✅ LIVE USD/EUR = %.6f",
-        usd_eur,
-    )
-
-    return (
+        "💱 USD/EUR = %.6f | EUR/USD = %.6f",
         usd_eur,
         eur_usd,
-        "LIVE",
     )
+
+    return usd_eur, eur_usd
 
 
 async def get_rate():
@@ -170,7 +100,7 @@ async def get_rate():
         try:
 
             return await asyncio.to_thread(
-                get_live_rate_sync
+                get_rate_sync
             )
 
         except Exception as e:
@@ -186,28 +116,8 @@ async def get_rate():
                     delays[attempt - 1]
                 )
 
-    cached = load_cache()
-
-    if cached:
-
-        usd_eur, eur_usd, saved_at = cached
-
-        age = int(time.time()) - saved_at
-
-        logger.warning(
-            "⚠️ API unavailable - using cache "
-            "(age=%s sec)",
-            age,
-        )
-
-        return (
-            usd_eur,
-            eur_usd,
-            "CACHE",
-        )
-
     raise RuntimeError(
-        "No live rate and no cache"
+        "Could not get exchange rate"
     )
 
 
@@ -215,10 +125,7 @@ async def get_rate():
 # MESSAGE
 # ============================================================
 
-def make_message(
-    usd_eur,
-    eur_usd,
-):
+def make_message(usd_eur, eur_usd):
 
     return (
         f"🇺🇸 1 USD = {usd_eur:.6f} EUR\n"
@@ -228,14 +135,10 @@ def make_message(
 
 
 # ============================================================
-# TELEGRAM SEND
+# SAFE TELEGRAM SEND
 # ============================================================
 
-async def send_safe(
-    context,
-    chat_id,
-    text,
-):
+async def send_safe(context, chat_id, text):
 
     for attempt in range(1, 4):
 
@@ -255,7 +158,7 @@ async def send_safe(
         except RetryAfter as e:
 
             logger.warning(
-                "Rate limited, waiting %s sec",
+                "Telegram rate limit: %s sec",
                 e.retry_after,
             )
 
@@ -282,12 +185,12 @@ async def send_safe(
         except Conflict:
 
             logger.critical(
-                "🚨 409 CONFLICT!"
+                "🚨 409 CONFLICT"
             )
 
             logger.critical(
-                "ANOTHER INSTANCE IS USING "
-                "THIS BOT TOKEN."
+                "Another process is using "
+                "this BOT_TOKEN."
             )
 
             return False
@@ -295,7 +198,7 @@ async def send_safe(
         except Exception as e:
 
             logger.exception(
-                "Telegram send failed: %s",
+                "Telegram send error: %s",
                 e,
             )
 
@@ -318,9 +221,7 @@ async def send_price(
 
     try:
 
-        usd_eur, eur_usd, source = (
-            await get_rate()
-        )
+        usd_eur, eur_usd = await get_rate()
 
         await send_safe(
             context,
@@ -331,17 +232,16 @@ async def send_price(
             ),
         )
 
-        logger.info(
-            "PRICE UPDATE OK | SOURCE=%s",
-            source,
-        )
-
     except Exception as e:
 
         logger.exception(
-            "PRICE UPDATE ERROR: %s",
+            "❌ Price update failed: %s",
             e,
         )
+
+    logger.info(
+        "=================================="
+    )
 
 
 # ============================================================
@@ -356,7 +256,8 @@ async def start(
     await update.message.reply_text(
         "🤖 LEX Bot خدام\n"
         "💱 USD / EUR\n"
-        "📊 Live market rate\n"
+        "📊 Exchange rate\n"
+        "⏰ تحديث تلقائي كل 3 ساعات\n"
         "By LEX"
     )
 
@@ -372,9 +273,7 @@ async def price(
 
     try:
 
-        usd_eur, eur_usd, source = (
-            await get_rate()
-        )
+        usd_eur, eur_usd = await get_rate()
 
         await update.message.reply_text(
             make_message(
@@ -386,7 +285,7 @@ async def price(
     except Exception as e:
 
         logger.exception(
-            "/price ERROR: %s",
+            "/price failed: %s",
             e,
         )
 
@@ -410,11 +309,11 @@ async def error_handler(
     if isinstance(error, Conflict):
 
         logger.critical(
-            "🚨 TELEGRAM 409 CONFLICT"
+            "🚨 409 CONFLICT"
         )
 
         logger.critical(
-            "Another process is using "
+            "Only ONE instance can use "
             "this BOT_TOKEN."
         )
 
@@ -427,7 +326,7 @@ async def error_handler(
 
 
 # ============================================================
-# START BOT
+# MAIN
 # ============================================================
 
 def main():
@@ -443,20 +342,7 @@ def main():
         )
 
     logger.info(
-        "===================================="
-    )
-
-    logger.info(
-        "🚀 LEX CURRENCY BOT STARTING"
-    )
-
-    logger.info(
-        "Python process PID: %s",
-        os.getpid(),
-    )
-
-    logger.info(
-        "===================================="
+        "🚀 Starting LEX Currency Bot"
     )
 
     app = (
@@ -494,51 +380,21 @@ def main():
     )
 
     logger.info(
-        "✅ Application initialized"
+        "✅ LEX Bot initialized"
     )
 
     logger.info(
-        "⏰ Automatic update: every 3 hours"
+        "⏰ Automatic update every 3 hours"
     )
 
     logger.info(
         "▶️ Starting Telegram polling..."
     )
 
-    try:
-
-        app.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
-
-    except Conflict:
-
-        logger.critical(
-            "🚨 409 CONFLICT - BOT STOPPED"
-        )
-
-        logger.critical(
-            "Only ONE running instance "
-            "may use this token."
-        )
-
-        raise
-
-    except Exception as e:
-
-        logger.exception(
-            "🔥 POLLING CRASHED: %s",
-            e,
-        )
-
-        raise
-
-    finally:
-
-        logger.critical(
-            "🛑 run_polling() EXITED"
-        )
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
