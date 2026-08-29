@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import asyncio
 import logging
@@ -7,6 +8,7 @@ import requests
 
 from telegram import Update
 from telegram.error import (
+    Conflict,
     NetworkError,
     TimedOut,
     RetryAfter,
@@ -17,23 +19,32 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ==================================================
+
+# ============================================================
 # CONFIG
-# ==================================================
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
 
-XE_URL = (
+UPDATE_INTERVAL = 3 * 60 * 60
+FIRST_UPDATE = 10
+
+XE_CONVERTER_URL = (
     "https://www.xe.com/currencyconverter/"
     "?Amount=1&From=USD&To=EUR"
 )
 
-UPDATE_INTERVAL = 3 * 60 * 60
+XE_TABLE_URL = (
+    "https://www.xe.com/currencytables/"
+)
 
-# ==================================================
+CACHE_FILE = "last_rate.json"
+
+
+# ============================================================
 # LOGGING
-# ==================================================
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,69 +59,421 @@ logging.basicConfig(
 logger = logging.getLogger("LEX")
 
 
-# ==================================================
-# GET XE RATE
-# ==================================================
+# ============================================================
+# HTTP SESSION
+# ============================================================
 
-def get_xe_rate():
+session = requests.Session()
 
-    response = requests.get(
-        XE_URL,
-        timeout=(5, 10),
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/120.0 Safari/537.36"
-            ),
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        },
+session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+})
+
+
+# ============================================================
+# CACHE
+# ============================================================
+
+def save_cache(usd_eur, eur_usd):
+
+    data = {
+        "usd_eur": usd_eur,
+        "eur_usd": eur_usd,
+        "timestamp": int(time.time()),
+    }
+
+    try:
+        with open(
+            CACHE_FILE,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                data,
+                f,
+            )
+
+    except Exception as e:
+
+        logger.warning(
+            "Could not save cache: %s",
+            e,
+        )
+
+
+def load_cache():
+
+    try:
+
+        if not os.path.exists(
+            CACHE_FILE
+        ):
+            return None
+
+        with open(
+            CACHE_FILE,
+            "r",
+            encoding="utf-8",
+        ) as f:
+
+            data = json.load(f)
+
+        usd_eur = float(
+            data["usd_eur"]
+        )
+
+        eur_usd = float(
+            data["eur_usd"]
+        )
+
+        timestamp = int(
+            data["timestamp"]
+        )
+
+        if usd_eur <= 0 or eur_usd <= 0:
+            return None
+
+        return (
+            usd_eur,
+            eur_usd,
+            timestamp,
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Could not load cache: %s",
+            e,
+        )
+
+        return None
+
+
+# ============================================================
+# VALIDATE RATE
+# ============================================================
+
+def validate_rate(rate):
+
+    try:
+
+        rate = float(rate)
+
+        if not (0.1 < rate < 2):
+            return None
+
+        return rate
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return None
+
+
+# ============================================================
+# METHOD 1
+# XE CONVERTER - STRUCTURED DATA
+# ============================================================
+
+def get_rate_from_converter():
+
+    response = session.get(
+        XE_CONVERTER_URL,
+        timeout=(5, 15),
     )
 
     response.raise_for_status()
 
     html = response.text
 
-    match = re.search(
-        r"1\s*USD\s*=\s*([0-9]+\.[0-9]+)\s*EUR",
-        html,
-        re.IGNORECASE,
+    # --------------------------------------------------------
+    # Look for JSON / structured data containing EUR value
+    # --------------------------------------------------------
+
+    patterns = [
+
+        # Common JSON-style representations
+        r'"EUR"\s*:\s*([0-9]+\.[0-9]+)',
+
+        r'"toCurrency"\s*:\s*"EUR".{0,500}?'
+        r'"rate"\s*:\s*([0-9]+\.[0-9]+)',
+
+        r'"rate"\s*:\s*([0-9]+\.[0-9]+).{0,500}?'
+        r'"EUR"',
+
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            html,
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        if match:
+
+            rate = validate_rate(
+                match.group(1)
+            )
+
+            if rate:
+
+                logger.info(
+                    "XE converter rate found: %.9f",
+                    rate,
+                )
+
+                return rate
+
+    # --------------------------------------------------------
+    # Fallback: extract converter numeric value
+    # --------------------------------------------------------
+
+    fallback_patterns = [
+
+        r'1\.00\s*USD\s*=\s*'
+        r'([0-9]+\.[0-9]+)\s*EUR',
+
+        r'1\s*USD\s*=\s*'
+        r'([0-9]+\.[0-9]+)\s*EUR',
+
+    ]
+
+    for pattern in fallback_patterns:
+
+        match = re.search(
+            pattern,
+            html,
+            re.IGNORECASE,
+        )
+
+        if match:
+
+            rate = validate_rate(
+                match.group(1)
+            )
+
+            if rate:
+
+                logger.info(
+                    "XE converter fallback rate: %.9f",
+                    rate,
+                )
+
+                return rate
+
+    raise RuntimeError(
+        "XE converter rate not found"
     )
 
-    if not match:
-        raise ValueError(
-            "XE rate not found"
+
+# ============================================================
+# METHOD 2
+# XE CURRENCY TABLES
+# ============================================================
+
+def get_rate_from_table():
+
+    response = session.get(
+        XE_TABLE_URL,
+        timeout=(5, 15),
+    )
+
+    response.raise_for_status()
+
+    html = response.text
+
+    # EUR / USD = 1.xxxxx
+    patterns = [
+
+        r'EUR\s*/\s*USD'
+        r'.{0,300}?'
+        r'([0-9]+\.[0-9]+)',
+
+        r'USD\s*/\s*EUR'
+        r'.{0,300}?'
+        r'([0-9]+\.[0-9]+)',
+
+    ]
+
+    for index, pattern in enumerate(
+        patterns
+    ):
+
+        match = re.search(
+            pattern,
+            html,
+            re.IGNORECASE | re.DOTALL,
         )
 
-    usd_eur = float(match.group(1))
+        if not match:
+            continue
 
-    if usd_eur <= 0:
-        raise ValueError(
-            "Invalid XE rate"
+        value = validate_rate(
+            match.group(1)
         )
 
-    eur_usd = 1 / usd_eur
+        if not value:
+            continue
 
-    return usd_eur, eur_usd
+        if index == 0:
+            # EUR/USD -> inverse
+            eur_usd = value
+            usd_eur = 1 / eur_usd
+
+        else:
+            # USD/EUR
+            usd_eur = value
+            eur_usd = 1 / usd_eur
+
+        logger.info(
+            "XE table rate found: %.9f",
+            usd_eur,
+        )
+
+        return (
+            usd_eur,
+            eur_usd,
+        )
+
+    raise RuntimeError(
+        "XE table rate not found"
+    )
 
 
-# ==================================================
-# ASYNC XE REQUEST WITH RETRIES
-# ==================================================
+# ============================================================
+# MAIN RATE FUNCTION
+# ============================================================
 
-async def get_rate_with_retry():
+def get_xe_rate():
 
-    delays = [2, 5, 10]
+    # --------------------------------------------------------
+    # METHOD 1
+    # --------------------------------------------------------
+
+    try:
+
+        usd_eur = (
+            get_rate_from_converter()
+        )
+
+        eur_usd = 1 / usd_eur
+
+        save_cache(
+            usd_eur,
+            eur_usd,
+        )
+
+        return (
+            usd_eur,
+            eur_usd,
+            "LIVE",
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Converter method failed: %s",
+            e,
+        )
+
+
+    # --------------------------------------------------------
+    # METHOD 2
+    # --------------------------------------------------------
+
+    try:
+
+        usd_eur, eur_usd = (
+            get_rate_from_table()
+        )
+
+        save_cache(
+            usd_eur,
+            eur_usd,
+        )
+
+        return (
+            usd_eur,
+            eur_usd,
+            "LIVE",
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Table method failed: %s",
+            e,
+        )
+
+
+    # --------------------------------------------------------
+    # METHOD 3 - CACHE
+    # --------------------------------------------------------
+
+    cached = load_cache()
+
+    if cached:
+
+        usd_eur, eur_usd, timestamp = (
+            cached
+        )
+
+        age = (
+            int(time.time())
+            - timestamp
+        )
+
+        logger.warning(
+            "Using cached XE rate. Age: %s seconds",
+            age,
+        )
+
+        return (
+            usd_eur,
+            eur_usd,
+            "CACHED",
+        )
+
+
+    raise RuntimeError(
+        "XE unavailable and no cached rate"
+    )
+
+
+# ============================================================
+# ASYNC RATE + RETRY
+# ============================================================
+
+async def get_rate():
+
+    delays = [
+        2,
+        5,
+        10,
+    ]
 
     for attempt in range(1, 4):
 
         try:
 
             logger.info(
-                "XE request attempt %s/3",
+                "Getting XE rate %s/3",
                 attempt,
             )
 
@@ -119,7 +482,7 @@ async def get_rate_with_retry():
             )
 
             logger.info(
-                "XE request successful"
+                "XE rate obtained successfully"
             )
 
             return result
@@ -133,18 +496,19 @@ async def get_rate_with_retry():
             )
 
             if attempt < 3:
+
                 await asyncio.sleep(
                     delays[attempt - 1]
                 )
 
     raise RuntimeError(
-        "XE unavailable after 3 attempts"
+        "XE failed after 3 attempts"
     )
 
 
-# ==================================================
+# ============================================================
 # MESSAGE
-# ==================================================
+# ============================================================
 
 def make_message(
     usd_eur,
@@ -158,11 +522,11 @@ def make_message(
     )
 
 
-# ==================================================
-# SEND MESSAGE WITH RETRY
-# ==================================================
+# ============================================================
+# TELEGRAM SEND WITH RETRY
+# ============================================================
 
-async def safe_send_message(
+async def send_telegram(
     context,
     chat_id,
     text,
@@ -178,7 +542,7 @@ async def safe_send_message(
             )
 
             logger.info(
-                "Telegram message sent successfully"
+                "Telegram message sent"
             )
 
             return True
@@ -186,7 +550,7 @@ async def safe_send_message(
         except RetryAfter as e:
 
             logger.warning(
-                "Telegram rate limit. Waiting %s seconds",
+                "Telegram rate limit: %s sec",
                 e.retry_after,
             )
 
@@ -201,15 +565,25 @@ async def safe_send_message(
 
             logger.warning(
                 "Telegram network error "
-                "(attempt %s/3): %s",
+                "%s/3: %s",
                 attempt,
                 e,
             )
 
             if attempt < 3:
+
                 await asyncio.sleep(
-                    3 * attempt
+                    attempt * 3
                 )
+
+        except Conflict:
+
+            logger.error(
+                "🚨 CONFLICT: another bot "
+                "instance is using this token!"
+            )
+
+            return False
 
         except Exception as e:
 
@@ -223,22 +597,22 @@ async def safe_send_message(
     return False
 
 
-# ==================================================
-# AUTOMATIC PRICE
-# ==================================================
+# ============================================================
+# AUTOMATIC UPDATE
+# ============================================================
 
 async def send_price(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
     logger.info(
-        "========== PRICE UPDATE START =========="
+        "========== PRICE UPDATE =========="
     )
 
     try:
 
-        usd_eur, eur_usd = (
-            await get_rate_with_retry()
+        usd_eur, eur_usd, source = (
+            await get_rate()
         )
 
         message = make_message(
@@ -246,7 +620,7 @@ async def send_price(
             eur_usd,
         )
 
-        success = await safe_send_message(
+        success = await send_telegram(
             context,
             GROUP_ID,
             message,
@@ -255,34 +629,27 @@ async def send_price(
         if success:
 
             logger.info(
-                "✅ PRICE UPDATE SUCCESS | "
-                "USD/EUR=%.6f",
+                "✅ PRICE SENT | "
+                "USD/EUR %.6f | SOURCE %s",
                 usd_eur,
-            )
-
-        else:
-
-            logger.error(
-                "❌ PRICE UPDATE FAILED"
+                source,
             )
 
     except Exception as e:
 
         logger.exception(
-            "❌ PRICE UPDATE ERROR: %s",
+            "❌ PRICE UPDATE FAILED: %s",
             e,
         )
 
-    finally:
-
-        logger.info(
-            "========== PRICE UPDATE END =========="
-        )
+    logger.info(
+        "=================================="
+    )
 
 
-# ==================================================
+# ============================================================
 # /START
-# ==================================================
+# ============================================================
 
 async def start(
     update: Update,
@@ -297,59 +664,48 @@ async def start(
     )
 
 
-# ==================================================
+# ============================================================
 # /PRICE
-# ==================================================
+# ============================================================
 
 async def price(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    logger.info(
-        "/price command received"
-    )
-
     try:
 
-        usd_eur, eur_usd = (
-            await get_rate_with_retry()
-        )
-
-        message = make_message(
-            usd_eur,
-            eur_usd,
+        usd_eur, eur_usd, source = (
+            await get_rate()
         )
 
         await update.message.reply_text(
-            message
+            make_message(
+                usd_eur,
+                eur_usd,
+            )
         )
 
         logger.info(
-            "✅ /price completed"
+            "/price successful | SOURCE %s",
+            source,
         )
 
     except Exception as e:
 
         logger.exception(
-            "❌ /price failed: %s",
+            "/price failed: %s",
             e,
         )
 
-        try:
-
-            await update.message.reply_text(
-                "❌ السعر غير متوفر حاليا.\n"
-                "عاود بعد شوية."
-            )
-
-        except Exception:
-            pass
+        await update.message.reply_text(
+            "❌ تعذر جلب السعر حاليا."
+        )
 
 
-# ==================================================
+# ============================================================
 # ERROR HANDLER
-# ==================================================
+# ============================================================
 
 async def error_handler(
     update: object,
@@ -358,15 +714,27 @@ async def error_handler(
 
     error = context.error
 
+    if isinstance(
+        error,
+        Conflict,
+    ):
+
+        logger.error(
+            "🚨 409 CONFLICT - "
+            "another instance is running"
+        )
+
+        return
+
     logger.exception(
         "Telegram application error: %s",
         error,
     )
 
 
-# ==================================================
-# RUN BOT
-# ==================================================
+# ============================================================
+# RUN
+# ============================================================
 
 def run_bot():
 
@@ -381,10 +749,10 @@ def run_bot():
         )
 
     logger.info(
-        "🚀 Starting LEX Currency Bot"
+        "🚀 Starting LEX Bot"
     )
 
-    application = (
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
         .connect_timeout(10)
@@ -394,31 +762,28 @@ def run_bot():
         .build()
     )
 
-    # Commands
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "start",
             start,
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "price",
             price,
         )
     )
 
-    # Errors
-    application.add_error_handler(
+    app.add_error_handler(
         error_handler
     )
 
-    # Automatic price
-    application.job_queue.run_repeating(
+    app.job_queue.run_repeating(
         send_price,
         interval=UPDATE_INTERVAL,
-        first=10,
+        first=FIRST_UPDATE,
     )
 
     logger.info(
@@ -426,27 +791,20 @@ def run_bot():
     )
 
     logger.info(
-        "⏰ Update interval: 3 hours"
+        "⏰ Updates every 3 hours"
     )
 
-    logger.info(
-        "🔄 First update: 10 seconds"
-    )
-
-    # Start Telegram
-    application.run_polling(
+    app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
 
 
-# ==================================================
+# ============================================================
 # AUTO RESTART
-# ==================================================
+# ============================================================
 
 def main():
-
-    restart_delay = 10
 
     while True:
 
@@ -455,7 +813,7 @@ def main():
             run_bot()
 
             logger.warning(
-                "⚠️ Bot stopped normally."
+                "Bot stopped."
             )
 
             break
@@ -463,31 +821,43 @@ def main():
         except KeyboardInterrupt:
 
             logger.info(
-                "🛑 Bot stopped manually."
+                "Bot stopped manually."
             )
 
             break
 
+        except Conflict:
+
+            logger.error(
+                "🚨 409 CONFLICT detected."
+            )
+
+            logger.error(
+                "Stop every other instance "
+                "using this BOT_TOKEN."
+            )
+
+            # لا نعيد التشغيل بسرعة
+            # لأن هذا لن يحل Conflict
+            time.sleep(30)
+
         except Exception as e:
 
             logger.exception(
-                "🔥 BOT CRASHED: %s",
+                "🔥 Fatal error: %s",
                 e,
             )
 
             logger.info(
-                "♻️ Restarting in %s seconds...",
-                restart_delay,
+                "♻️ Restarting in 15 seconds..."
             )
 
-            time.sleep(
-                restart_delay
-            )
+            time.sleep(15)
 
 
-# ==================================================
+# ============================================================
 # START
-# ==================================================
+# ============================================================
 
 if __name__ == "__main__":
     main()
