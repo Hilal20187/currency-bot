@@ -32,17 +32,16 @@ UPDATE_INTERVAL = 3 * 60 * 60
 # أول تحديث بعد 10 ثواني
 FIRST_UPDATE = 10
 
-# Frankfurter API - JSON مباشر
+# Frankfurter JSON API
+# بدون API KEY
 FRANKFURTER_URL = (
     "https://api.frankfurter.dev/v2/rate/USD/EUR"
 )
 
-# نطلب ECB فقط
-FRANKFURTER_PARAMS = {
-    "providers": "ECB"
-}
+# مهم:
+# لا نضع providers=ECB
+# حتى لا نجبر السعر على ECB reference rate.
 
-# تخزين آخر سعر صحيح
 CACHE_FILE = "last_rate.json"
 
 
@@ -70,7 +69,7 @@ logger = logging.getLogger("LEX")
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "LEX-Currency-Bot/1.0",
+    "User-Agent": "LEX-Currency-Bot/2.0",
     "Accept": "application/json",
 })
 
@@ -79,15 +78,18 @@ session.headers.update({
 # CACHE
 # ============================================================
 
-def save_cache(usd_eur, eur_usd):
-    """
-    Save the last valid rate locally.
-    """
+def save_cache(
+    usd_eur,
+    eur_usd,
+    rate_date=None,
+):
 
     try:
+
         data = {
             "usd_eur": usd_eur,
             "eur_usd": eur_usd,
+            "rate_date": rate_date,
             "timestamp": int(time.time()),
         }
 
@@ -102,10 +104,6 @@ def save_cache(usd_eur, eur_usd):
                 file,
             )
 
-        logger.info(
-            "💾 Rate saved to cache"
-        )
-
     except Exception as e:
 
         logger.warning(
@@ -115,9 +113,6 @@ def save_cache(usd_eur, eur_usd):
 
 
 def load_cache():
-    """
-    Load last valid rate.
-    """
 
     try:
 
@@ -146,6 +141,10 @@ def load_cache():
             data["timestamp"]
         )
 
+        rate_date = data.get(
+            "rate_date"
+        )
+
         if usd_eur <= 0:
             return None
 
@@ -155,6 +154,7 @@ def load_cache():
         return (
             usd_eur,
             eur_usd,
+            rate_date,
             timestamp,
         )
 
@@ -173,17 +173,15 @@ def load_cache():
 # ============================================================
 
 def validate_rate(rate):
-    """
-    Basic protection against bad API data.
-    """
 
     try:
 
         rate = float(rate)
 
-        # USD/EUR should realistically be between
-        # these limits.
-        if not (0.1 < rate < 2.0):
+        # حماية من API يعطي قيمة غير منطقية
+        if not (
+            0.1 < rate < 2.0
+        ):
             return None
 
         return rate
@@ -197,14 +195,10 @@ def validate_rate(rate):
 
 
 # ============================================================
-# FRANKFURTER JSON
+# GET FRANKFURTER RATE
 # ============================================================
 
 def get_frankfurter_rate():
-    """
-    Get USD -> EUR directly from Frankfurter JSON API.
-    No API key required.
-    """
 
     logger.info(
         "🌐 Requesting Frankfurter JSON..."
@@ -212,13 +206,12 @@ def get_frankfurter_rate():
 
     response = session.get(
         FRANKFURTER_URL,
-        params=FRANKFURTER_PARAMS,
         timeout=(5, 10),
     )
 
     response.raise_for_status()
 
-    # JSON مباشرة
+    # JSON فقط
     data = response.json()
 
     logger.info(
@@ -229,15 +222,25 @@ def get_frankfurter_rate():
     # Expected:
     #
     # {
-    #   "date": "2026-...",
+    #   "date": "2026-08-28",
     #   "base": "USD",
     #   "quote": "EUR",
-    #   "rate": 0.xxxx
+    #   "rate": 0.86...
     # }
+
+    if data.get("base") != "USD":
+        raise RuntimeError(
+            "Unexpected base currency"
+        )
+
+    if data.get("quote") != "EUR":
+        raise RuntimeError(
+            "Unexpected quote currency"
+        )
 
     if "rate" not in data:
         raise RuntimeError(
-            "Frankfurter JSON has no rate"
+            "Rate missing from JSON"
         )
 
     usd_eur = validate_rate(
@@ -251,34 +254,40 @@ def get_frankfurter_rate():
 
     eur_usd = 1 / usd_eur
 
+    rate_date = data.get(
+        "date"
+    )
+
+    # حفظ آخر سعر صحيح
     save_cache(
         usd_eur,
         eur_usd,
+        rate_date,
     )
 
     logger.info(
-        "✅ Frankfurter rate: %.9f",
+        "✅ USD/EUR = %.9f",
         usd_eur,
+    )
+
+    logger.info(
+        "📅 Rate date = %s",
+        rate_date,
     )
 
     return (
         usd_eur,
         eur_usd,
-        "ECB",
-        data.get("date"),
+        "FRANKFURTER",
+        rate_date,
     )
 
 
 # ============================================================
-# ASYNC RATE WITH RETRY
+# ASYNC RATE + RETRY
 # ============================================================
 
 async def get_rate():
-    """
-    Try Frankfurter 3 times.
-    If API is temporarily unavailable,
-    use the last valid cached rate.
-    """
 
     retry_delays = [
         2,
@@ -304,7 +313,7 @@ async def get_rate():
         except Exception as e:
 
             logger.warning(
-                "❌ Attempt %s failed: %s",
+                "❌ Rate attempt %s failed: %s",
                 attempt,
                 e,
             )
@@ -328,6 +337,7 @@ async def get_rate():
         (
             usd_eur,
             eur_usd,
+            rate_date,
             timestamp,
         ) = cached
 
@@ -341,7 +351,11 @@ async def get_rate():
         )
 
         logger.warning(
-            "Using cached rate. Age: %s seconds",
+            "Using cached rate."
+        )
+
+        logger.warning(
+            "Cache age: %s seconds",
             age,
         )
 
@@ -349,7 +363,7 @@ async def get_rate():
             usd_eur,
             eur_usd,
             "CACHE",
-            None,
+            rate_date,
         )
 
     raise RuntimeError(
@@ -375,7 +389,7 @@ def make_message(
 
 
 # ============================================================
-# TELEGRAM SEND WITH RETRY
+# TELEGRAM SEND
 # ============================================================
 
 async def send_message_safe(
@@ -402,7 +416,8 @@ async def send_message_safe(
         except RetryAfter as e:
 
             logger.warning(
-                "Telegram rate limit: %s seconds",
+                "Telegram rate limit: "
+                "%s seconds",
                 e.retry_after,
             )
 
@@ -431,12 +446,12 @@ async def send_message_safe(
         except Conflict:
 
             logger.error(
-                "🚨 409 CONFLICT!"
+                "🚨 409 CONFLICT"
             )
 
             logger.error(
-                "Another instance is using "
-                "this BOT_TOKEN."
+                "Another bot instance "
+                "is using this BOT_TOKEN."
             )
 
             return False
@@ -454,7 +469,7 @@ async def send_message_safe(
 
 
 # ============================================================
-# AUTOMATIC UPDATE
+# AUTOMATIC PRICE
 # ============================================================
 
 async def send_price(
@@ -501,12 +516,10 @@ async def send_price(
                 source,
             )
 
-            if rate_date:
-
-                logger.info(
-                    "RATE DATE: %s",
-                    rate_date,
-                )
+            logger.info(
+                "RATE DATE: %s",
+                rate_date,
+            )
 
     except Exception as e:
 
@@ -535,7 +548,6 @@ async def start(
         "🤖 LEX Bot خدام\n"
         "💱 USD / EUR\n"
         "⏰ تحديث كل 3 ساعات\n"
-        "📊 ECB Reference Rate\n"
         "By LEX"
     )
 
@@ -550,7 +562,7 @@ async def price(
 ):
 
     logger.info(
-        "📊 /price command received"
+        "📊 /price received"
     )
 
     try:
@@ -570,8 +582,10 @@ async def price(
         )
 
         logger.info(
-            "✅ /price successful | SOURCE=%s",
+            "✅ /price successful | "
+            "SOURCE=%s | DATE=%s",
             source,
+            rate_date,
         )
 
     except Exception as e:
@@ -587,11 +601,11 @@ async def price(
 
 
 # ============================================================
-# ERROR HANDLER
+# TELEGRAM ERROR HANDLER
 # ============================================================
 
 async def error_handler(
-    update: object,
+    update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
@@ -607,7 +621,8 @@ async def error_handler(
         )
 
         logger.error(
-            "Only ONE bot instance can run."
+            "Only ONE instance of "
+            "this bot can run."
         )
 
         return
@@ -663,7 +678,7 @@ def run_bot():
         )
     )
 
-    # Error handler
+    # Errors
     app.add_error_handler(
         error_handler
     )
@@ -687,7 +702,7 @@ def run_bot():
         "🔄 First update after 10 seconds"
     )
 
-    # Start Telegram polling
+    # Telegram polling
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
@@ -727,11 +742,12 @@ def main():
             )
 
             logger.error(
-                "Stop all other instances "
+                "Stop every other instance "
                 "using this BOT_TOKEN."
             )
 
-            # Don't restart aggressively.
+            # لا نعيد التشغيل بسرعة
+            # لأن restart لن يحل Conflict
             time.sleep(30)
 
         except Exception as e:
