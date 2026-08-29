@@ -23,6 +23,7 @@ XE_URL = (
     "convert/?Amount=1&From=USD&To=EUR"
 )
 
+
 # =========================
 # LOGGING
 # =========================
@@ -46,7 +47,9 @@ def get_xe_rate():
         headers={
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/120.0 Safari/537.36"
             ),
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
@@ -57,6 +60,7 @@ def get_xe_rate():
 
     html = response.text
 
+    # البحث عن سعر USD → EUR
     match = re.search(
         r"1\s*USD\s*=\s*([0-9]+\.[0-9]+)\s*EUR",
         html,
@@ -64,43 +68,60 @@ def get_xe_rate():
     )
 
     if not match:
-        raise Exception("XE rate not found in page")
+        raise Exception("XE rate not found")
 
     usd_eur = float(match.group(1))
+
+    if usd_eur <= 0:
+        raise Exception("Invalid XE rate")
+
     eur_usd = 1 / usd_eur
 
     return usd_eur, eur_usd
 
 
 # =========================
-# ASYNC XE REQUEST
+# ASYNC REQUEST
 # =========================
 
 async def get_rate_async():
-    """
-    Run requests in a separate thread so Telegram
-    event loop doesn't freeze.
-    """
 
-    return await asyncio.to_thread(get_xe_rate)
+    # requests ما يجمّدش Telegram
+    return await asyncio.to_thread(
+        get_xe_rate
+    )
 
 
 # =========================
-# SEND PRICE
+# FORMAT MESSAGE
 # =========================
 
-async def send_price(context: ContextTypes.DEFAULT_TYPE):
+def create_message(usd_eur, eur_usd):
+
+    return (
+        f"🇺🇸 1 USD = {usd_eur:.6f} EUR\n"
+        f"🇪🇺 1 EUR = {eur_usd:.6f} USD\n\n"
+        "By LEX"
+    )
+
+
+# =========================
+# AUTOMATIC PRICE
+# =========================
+
+async def send_price(
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     logger.info("🔄 Getting XE rate...")
 
     try:
+
         usd_eur, eur_usd = await get_rate_async()
 
-        message = (
-    f"🇺🇸 1 USD = {usd_eur:.6f} EUR\n"
-    f"🇪🇺 1 EUR = {eur_usd:.6f} USD\n\n"
-    "By LEX"
-)
+        message = create_message(
+            usd_eur,
+            eur_usd,
         )
 
         await context.bot.send_message(
@@ -109,12 +130,16 @@ async def send_price(context: ContextTypes.DEFAULT_TYPE):
         )
 
         logger.info(
-            "✅ XE price sent: %.6f",
+            "✅ Price sent: USD/EUR %.6f",
             usd_eur,
         )
 
-    except Exception:
-        logger.exception("❌ XE ERROR")
+    except Exception as e:
+
+        logger.error(
+            "❌ XE ERROR: %s",
+            e,
+        )
 
 
 # =========================
@@ -128,8 +153,9 @@ async def start(
 
     await update.message.reply_text(
         "🤖 البوت خدام\n"
-        "💱 السعر من XE\n"
-        "⏰ تحديث تلقائي كل 3 ساعات"
+        "💱 USD / EUR\n"
+        "⏰ تحديث كل 3 ساعات\n"
+        "By LEX"
     )
 
 
@@ -143,25 +169,48 @@ async def price(
 ):
 
     try:
-        logger.info("📊 Manual /price request")
+
+        logger.info(
+            "📊 Manual /price request"
+        )
 
         usd_eur, eur_usd = await get_rate_async()
 
-        await update.message.reply_text(
-            "💱 XE LIVE RATE\n\n"
-            f"🇺🇸 1 USD = {usd_eur:.6f} EUR\n"
-            f"🇪🇺 1 EUR = {eur_usd:.6f} USD\n\n"
-            "📊 Mid-market rate\n"
-            "🔄 XE"
+        message = create_message(
+            usd_eur,
+            eur_usd,
         )
 
-    except Exception:
-        logger.exception("❌ /price ERROR")
+        await update.message.reply_text(
+            message
+        )
+
+    except Exception as e:
+
+        logger.error(
+            "❌ /price ERROR: %s",
+            e,
+        )
 
         await update.message.reply_text(
-            "❌ ماقدرتش نجيب سعر XE حاليا، "
+            "❌ ماقدرتش نجيب السعر حاليا، "
             "عاود بعد شوية."
         )
+
+
+# =========================
+# ERROR HANDLER
+# =========================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    logger.error(
+        "❌ Telegram error: %s",
+        context.error,
+    )
 
 
 # =========================
@@ -170,13 +219,23 @@ async def price(
 
 def main():
 
+    # التأكد من Environment Variables
+
     if not BOT_TOKEN:
-        raise RuntimeError("❌ BOT_TOKEN missing")
+        raise RuntimeError(
+            "❌ BOT_TOKEN missing"
+        )
 
     if not GROUP_ID:
-        raise RuntimeError("❌ GROUP_ID missing")
+        raise RuntimeError(
+            "❌ GROUP_ID missing"
+        )
 
-    logger.info("🤖 Starting XE Currency Bot...")
+    logger.info(
+        "🤖 Starting LEX Currency Bot..."
+    )
+
+    # إنشاء البوت
 
     app = (
         Application.builder()
@@ -185,30 +244,61 @@ def main():
     )
 
     # Commands
+
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
     app.add_handler(
-        CommandHandler("price", price)
+        CommandHandler(
+            "price",
+            price,
+        )
     )
 
-    # Automatic update
+    # Error handler
+
+    app.add_error_handler(
+        error_handler
+    )
+
+    # =========================
+    # AUTOMATIC UPDATE
+    # =========================
+
+    # أول تحديث بعد 10 ثواني
+    # ثم كل 3 ساعات
+
     app.job_queue.run_repeating(
         send_price,
         interval=3 * 60 * 60,
         first=10,
     )
 
-    logger.info("✅ Bot started successfully")
-    logger.info("⏰ Automatic update: every 3 hours")
+    logger.info(
+        "✅ LEX Currency Bot started"
+    )
 
-    # Telegram polling
+    logger.info(
+        "⏰ Automatic update: every 3 hours"
+    )
+
+    # =========================
+    # START POLLING
+    # =========================
+
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
 
 
+# =========================
+# RUN
+# =========================
+
 if __name__ == "__main__":
-    main()
+    main() 
