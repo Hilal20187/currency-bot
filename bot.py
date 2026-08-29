@@ -97,11 +97,10 @@ async def send_price(context: ContextTypes.DEFAULT_TYPE):
         usd_eur, eur_usd = await get_rate_async()
 
         message = (
-            "💱 XE LIVE RATE\n\n"
-            f"🇺🇸 1 USD = {usd_eur:.6f} EUR\n"
-            f"🇪🇺 1 EUR = {eur_usd:.6f} USD\n\n"
-            "📊 Mid-market rate\n"
-            "🔄 XE"
+    f"🇺🇸 1 USD = {usd_eur:.6f} EUR\n"
+    f"🇪🇺 1 EUR = {eur_usd:.6f} USD\n\n"
+    "By LEX"
+)
         )
 
         await context.bot.send_message(
