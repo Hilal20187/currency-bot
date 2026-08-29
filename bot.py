@@ -1,52 +1,66 @@
 import os
 import re
+import time
 import asyncio
 import logging
 import requests
 
 from telegram import Update
+from telegram.error import (
+    NetworkError,
+    TimedOut,
+    RetryAfter,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
 )
 
-# =========================
-# SETTINGS
-# =========================
+# ==================================================
+# CONFIG
+# ==================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
 
 XE_URL = (
     "https://www.xe.com/currencyconverter/"
-    "convert/?Amount=1&From=USD&To=EUR"
+    "?Amount=1&From=USD&To=EUR"
 )
 
+UPDATE_INTERVAL = 3 * 60 * 60
 
-# =========================
+# ==================================================
 # LOGGING
-# =========================
+# ==================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("LEX")
 
 
-# =========================
+# ==================================================
 # GET XE RATE
-# =========================
+# ==================================================
 
 def get_xe_rate():
+
     response = requests.get(
         XE_URL,
-        timeout=15,
+        timeout=(5, 10),
         headers={
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 "
                 "(KHTML, like Gecko) "
                 "Chrome/120.0 Safari/537.36"
@@ -60,7 +74,6 @@ def get_xe_rate():
 
     html = response.text
 
-    # البحث عن سعر USD → EUR
     match = re.search(
         r"1\s*USD\s*=\s*([0-9]+\.[0-9]+)\s*EUR",
         html,
@@ -68,35 +81,75 @@ def get_xe_rate():
     )
 
     if not match:
-        raise Exception("XE rate not found")
+        raise ValueError(
+            "XE rate not found"
+        )
 
     usd_eur = float(match.group(1))
 
     if usd_eur <= 0:
-        raise Exception("Invalid XE rate")
+        raise ValueError(
+            "Invalid XE rate"
+        )
 
     eur_usd = 1 / usd_eur
 
     return usd_eur, eur_usd
 
 
-# =========================
-# ASYNC REQUEST
-# =========================
+# ==================================================
+# ASYNC XE REQUEST WITH RETRIES
+# ==================================================
 
-async def get_rate_async():
+async def get_rate_with_retry():
 
-    # requests ما يجمّدش Telegram
-    return await asyncio.to_thread(
-        get_xe_rate
+    delays = [2, 5, 10]
+
+    for attempt in range(1, 4):
+
+        try:
+
+            logger.info(
+                "XE request attempt %s/3",
+                attempt,
+            )
+
+            result = await asyncio.to_thread(
+                get_xe_rate
+            )
+
+            logger.info(
+                "XE request successful"
+            )
+
+            return result
+
+        except Exception as e:
+
+            logger.warning(
+                "XE attempt %s failed: %s",
+                attempt,
+                e,
+            )
+
+            if attempt < 3:
+                await asyncio.sleep(
+                    delays[attempt - 1]
+                )
+
+    raise RuntimeError(
+        "XE unavailable after 3 attempts"
     )
 
 
-# =========================
-# FORMAT MESSAGE
-# =========================
+# ==================================================
+# MESSAGE
+# ==================================================
 
-def create_message(usd_eur, eur_usd):
+def make_message(
+    usd_eur,
+    eur_usd,
+):
 
     return (
         f"🇺🇸 1 USD = {usd_eur:.6f} EUR\n"
@@ -105,46 +158,131 @@ def create_message(usd_eur, eur_usd):
     )
 
 
-# =========================
-# AUTOMATIC PRICE
-# =========================
+# ==================================================
+# SEND MESSAGE WITH RETRY
+# ==================================================
 
-async def send_price(
-    context: ContextTypes.DEFAULT_TYPE
+async def safe_send_message(
+    context,
+    chat_id,
+    text,
 ):
 
-    logger.info("🔄 Getting XE rate...")
+    for attempt in range(1, 4):
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+            )
+
+            logger.info(
+                "Telegram message sent successfully"
+            )
+
+            return True
+
+        except RetryAfter as e:
+
+            logger.warning(
+                "Telegram rate limit. Waiting %s seconds",
+                e.retry_after,
+            )
+
+            await asyncio.sleep(
+                e.retry_after
+            )
+
+        except (
+            TimedOut,
+            NetworkError,
+        ) as e:
+
+            logger.warning(
+                "Telegram network error "
+                "(attempt %s/3): %s",
+                attempt,
+                e,
+            )
+
+            if attempt < 3:
+                await asyncio.sleep(
+                    3 * attempt
+                )
+
+        except Exception as e:
+
+            logger.exception(
+                "Telegram send error: %s",
+                e,
+            )
+
+            return False
+
+    return False
+
+
+# ==================================================
+# AUTOMATIC PRICE
+# ==================================================
+
+async def send_price(
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    logger.info(
+        "========== PRICE UPDATE START =========="
+    )
 
     try:
 
-        usd_eur, eur_usd = await get_rate_async()
+        usd_eur, eur_usd = (
+            await get_rate_with_retry()
+        )
 
-        message = create_message(
+        message = make_message(
             usd_eur,
             eur_usd,
         )
 
-        await context.bot.send_message(
-            chat_id=GROUP_ID,
-            text=message,
+        success = await safe_send_message(
+            context,
+            GROUP_ID,
+            message,
         )
 
-        logger.info(
-            "✅ Price sent: USD/EUR %.6f",
-            usd_eur,
-        )
+        if success:
+
+            logger.info(
+                "✅ PRICE UPDATE SUCCESS | "
+                "USD/EUR=%.6f",
+                usd_eur,
+            )
+
+        else:
+
+            logger.error(
+                "❌ PRICE UPDATE FAILED"
+            )
 
     except Exception as e:
 
-        logger.error(
-            "❌ XE ERROR: %s",
+        logger.exception(
+            "❌ PRICE UPDATE ERROR: %s",
             e,
         )
 
+    finally:
 
-# =========================
+        logger.info(
+            "========== PRICE UPDATE END =========="
+        )
+
+
+# ==================================================
 # /START
-# =========================
+# ==================================================
 
 async def start(
     update: Update,
@@ -152,31 +290,33 @@ async def start(
 ):
 
     await update.message.reply_text(
-        "🤖 البوت خدام\n"
+        "🤖 LEX Bot خدام\n"
         "💱 USD / EUR\n"
         "⏰ تحديث كل 3 ساعات\n"
         "By LEX"
     )
 
 
-# =========================
+# ==================================================
 # /PRICE
-# =========================
+# ==================================================
 
 async def price(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    logger.info(
+        "/price command received"
+    )
+
     try:
 
-        logger.info(
-            "📊 Manual /price request"
+        usd_eur, eur_usd = (
+            await get_rate_with_retry()
         )
 
-        usd_eur, eur_usd = await get_rate_async()
-
-        message = create_message(
+        message = make_message(
             usd_eur,
             eur_usd,
         )
@@ -185,120 +325,169 @@ async def price(
             message
         )
 
+        logger.info(
+            "✅ /price completed"
+        )
+
     except Exception as e:
 
-        logger.error(
-            "❌ /price ERROR: %s",
+        logger.exception(
+            "❌ /price failed: %s",
             e,
         )
 
-        await update.message.reply_text(
-            "❌ ماقدرتش نجيب السعر حاليا، "
-            "عاود بعد شوية."
-        )
+        try:
+
+            await update.message.reply_text(
+                "❌ السعر غير متوفر حاليا.\n"
+                "عاود بعد شوية."
+            )
+
+        except Exception:
+            pass
 
 
-# =========================
+# ==================================================
 # ERROR HANDLER
-# =========================
+# ==================================================
 
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    logger.error(
-        "❌ Telegram error: %s",
-        context.error,
+    error = context.error
+
+    logger.exception(
+        "Telegram application error: %s",
+        error,
     )
 
 
-# =========================
-# MAIN
-# =========================
+# ==================================================
+# RUN BOT
+# ==================================================
 
-def main():
-
-    # التأكد من Environment Variables
+def run_bot():
 
     if not BOT_TOKEN:
         raise RuntimeError(
-            "❌ BOT_TOKEN missing"
+            "BOT_TOKEN missing"
         )
 
     if not GROUP_ID:
         raise RuntimeError(
-            "❌ GROUP_ID missing"
+            "GROUP_ID missing"
         )
 
     logger.info(
-        "🤖 Starting LEX Currency Bot..."
+        "🚀 Starting LEX Currency Bot"
     )
 
-    # إنشاء البوت
-
-    app = (
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .connect_timeout(10)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(10)
         .build()
     )
 
     # Commands
-
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "start",
             start,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "price",
             price,
         )
     )
 
-    # Error handler
-
-    app.add_error_handler(
+    # Errors
+    application.add_error_handler(
         error_handler
     )
 
-    # =========================
-    # AUTOMATIC UPDATE
-    # =========================
-
-    # أول تحديث بعد 10 ثواني
-    # ثم كل 3 ساعات
-
-    app.job_queue.run_repeating(
+    # Automatic price
+    application.job_queue.run_repeating(
         send_price,
-        interval=3 * 60 * 60,
+        interval=UPDATE_INTERVAL,
         first=10,
     )
 
     logger.info(
-        "✅ LEX Currency Bot started"
+        "✅ Bot initialized"
     )
 
     logger.info(
-        "⏰ Automatic update: every 3 hours"
+        "⏰ Update interval: 3 hours"
     )
 
-    # =========================
-    # START POLLING
-    # =========================
+    logger.info(
+        "🔄 First update: 10 seconds"
+    )
 
-    app.run_polling(
+    # Start Telegram
+    application.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
 
 
-# =========================
-# RUN
-# =========================
+# ==================================================
+# AUTO RESTART
+# ==================================================
+
+def main():
+
+    restart_delay = 10
+
+    while True:
+
+        try:
+
+            run_bot()
+
+            logger.warning(
+                "⚠️ Bot stopped normally."
+            )
+
+            break
+
+        except KeyboardInterrupt:
+
+            logger.info(
+                "🛑 Bot stopped manually."
+            )
+
+            break
+
+        except Exception as e:
+
+            logger.exception(
+                "🔥 BOT CRASHED: %s",
+                e,
+            )
+
+            logger.info(
+                "♻️ Restarting in %s seconds...",
+                restart_delay,
+            )
+
+            time.sleep(
+                restart_delay
+            )
+
+
+# ==================================================
+# START
+# ==================================================
 
 if __name__ == "__main__":
-    main() 
+    main()
