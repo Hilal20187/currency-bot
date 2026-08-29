@@ -26,14 +26,18 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
 
-# تحديث تلقائي كل 15 دقيقة
+# Twelve Data API key
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+
+# تحديث كل 15 دقيقة
 UPDATE_INTERVAL = 15 * 60
 
 # أول تحديث بعد 10 ثواني
 FIRST_UPDATE = 10
 
-# Intraday FX API
-API_URL = "https://api.exchangerate.dev/v1/rates/USD/EUR"
+# أقصى فرق مسموح بين المصدرين
+# 0.0025 = 0.25%
+MAX_SOURCE_DIFFERENCE = Decimal("0.0025")
 
 
 # ============================================================
@@ -55,20 +59,20 @@ logger = logging.getLogger("LEX")
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "LEX-Currency-Bot/1.0",
+    "User-Agent": "LEX-FX-Bot/2.0",
     "Accept": "application/json",
 })
 
 
 # ============================================================
-# RATE VALIDATION
+# VALIDATE RATE
 # ============================================================
 
 def validate_rate(value):
     try:
         rate = Decimal(str(value))
 
-        # USD/EUR منطقي
+        # USD/EUR يجب أن يكون في نطاق منطقي
         if rate <= Decimal("0.50"):
             return None
 
@@ -86,15 +90,30 @@ def validate_rate(value):
 
 
 # ============================================================
-# GET USD/EUR
+# SOURCE 1 — TWELVE DATA
 # ============================================================
 
-def get_usd_eur_sync():
+def get_twelve_data():
 
-    logger.info("🌐 Getting intraday USD/EUR rate...")
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError(
+            "TWELVE_DATA_API_KEY missing"
+        )
+
+    url = "https://api.twelvedata.com/price"
+
+    params = {
+        "symbol": "EUR/USD",
+        "apikey": TWELVE_DATA_API_KEY,
+    }
+
+    logger.info(
+        "1️⃣ Requesting Twelve Data..."
+    )
 
     response = session.get(
-        API_URL,
+        url,
+        params=params,
         timeout=(5, 15),
     )
 
@@ -102,66 +121,214 @@ def get_usd_eur_sync():
 
     data = response.json()
 
-    logger.info(
-        "API response received"
-    )
-
-    # --------------------------------------------------------
-    # exchangerate.dev response
-    # --------------------------------------------------------
-
-    rate = data.get("rate")
-
-    if rate is None:
-
-        # fallback لبعض أشكال JSON
-        rates = data.get("rates")
-
-        if isinstance(rates, dict):
-            rate = rates.get("EUR")
-
-    rate = validate_rate(rate)
-
-    if rate is None:
-
+    # API error
+    if data.get("status") == "error":
         raise RuntimeError(
-            f"Invalid USD/EUR rate: {data}"
+            data.get(
+                "message",
+                "Twelve Data error"
+            )
         )
 
-    eur_usd = Decimal("1") / rate
+    price = data.get("price")
 
-    # --------------------------------------------------------
-    # Metadata إذا كانت موجودة
-    # --------------------------------------------------------
+    if price is None:
+        raise RuntimeError(
+            f"Twelve Data price missing: {data}"
+        )
 
-    source = (
-        data.get("source")
-        or data.get("provider")
-        or "FX API"
-    )
+    # Twelve Data يعطينا EUR/USD
+    eur_usd = validate_rate(price)
 
-    updated = (
-        data.get("data_updated_at")
-        or data.get("updated_at")
-        or data.get("timestamp")
-        or ""
+    if eur_usd is None:
+        raise RuntimeError(
+            f"Invalid EUR/USD: {price}"
+        )
+
+    # نحول إلى USD/EUR
+    usd_eur = Decimal("1") / eur_usd
+
+    logger.info(
+        "✅ Twelve Data EUR/USD = %.8f",
+        eur_usd,
     )
 
     logger.info(
-        "✅ USD/EUR = %s | source=%s | updated=%s",
-        rate,
-        source,
-        updated,
+        "✅ Twelve Data USD/EUR = %.8f",
+        usd_eur,
     )
 
-    return rate, eur_usd, source, updated
+    return usd_eur
+
+
+# ============================================================
+# SOURCE 2 — EXCHANGERATE.DEV
+# ============================================================
+
+def get_exchangerate_dev():
+
+    url = (
+        "https://api.exchangerate.dev/"
+        "v1/latest/USD"
+    )
+
+    params = {
+        "symbols": "EUR",
+    }
+
+    logger.info(
+        "2️⃣ Requesting ExchangeRate.dev..."
+    )
+
+    response = session.get(
+        url,
+        params=params,
+        timeout=(5, 15),
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if data.get("result") != "success":
+        raise RuntimeError(
+            f"ExchangeRate.dev error: {data}"
+        )
+
+    rates = data.get("rates")
+
+    if not isinstance(rates, dict):
+        raise RuntimeError(
+            "ExchangeRate.dev rates missing"
+        )
+
+    value = rates.get("EUR")
+
+    usd_eur = validate_rate(value)
+
+    if usd_eur is None:
+        raise RuntimeError(
+            f"Invalid ExchangeRate.dev USD/EUR: {value}"
+        )
+
+    source = data.get(
+        "source",
+        "unknown"
+    )
+
+    market_session = data.get(
+        "market_session",
+        "unknown"
+    )
+
+    timestamp = data.get(
+        "data_updated_at",
+        data.get("timestamp", "")
+    )
+
+    logger.info(
+        "✅ ExchangeRate.dev USD/EUR = %.8f",
+        usd_eur,
+    )
+
+    logger.info(
+        "Source=%s | Session=%s | Updated=%s",
+        source,
+        market_session,
+        timestamp,
+    )
+
+    return usd_eur
+
+
+# ============================================================
+# DOUBLE VERIFICATION
+# ============================================================
+
+def get_verified_rate_sync():
+
+    # --------------------------------------------------------
+    # SOURCE 1
+    # --------------------------------------------------------
+
+    twelve_rate = get_twelve_data()
+
+    # --------------------------------------------------------
+    # SOURCE 2
+    # --------------------------------------------------------
+
+    second_rate = get_exchangerate_dev()
+
+    # --------------------------------------------------------
+    # Calculate difference
+    # --------------------------------------------------------
+
+    difference = abs(
+        twelve_rate - second_rate
+    )
+
+    average = (
+        twelve_rate + second_rate
+    ) / Decimal("2")
+
+    relative_difference = (
+        difference / average
+    )
+
+    logger.info(
+        "📊 Source 1: %.8f",
+        twelve_rate,
+    )
+
+    logger.info(
+        "📊 Source 2: %.8f",
+        second_rate,
+    )
+
+    logger.info(
+        "📊 Difference: %.4f%%",
+        relative_difference * 100,
+    )
+
+    # --------------------------------------------------------
+    # SAFETY CHECK
+    # --------------------------------------------------------
+
+    if relative_difference > MAX_SOURCE_DIFFERENCE:
+
+        raise RuntimeError(
+            "⚠️ Sources disagree too much: "
+            f"{relative_difference * 100:.4f}%"
+        )
+
+    # --------------------------------------------------------
+    # Use midpoint between both sources
+    # --------------------------------------------------------
+
+    usd_eur = average
+
+    eur_usd = (
+        Decimal("1") / usd_eur
+    )
+
+    logger.info(
+        "🎯 VERIFIED USD/EUR = %.8f",
+        usd_eur,
+    )
+
+    logger.info(
+        "🎯 VERIFIED EUR/USD = %.8f",
+        eur_usd,
+    )
+
+    return usd_eur, eur_usd
 
 
 # ============================================================
 # ASYNC RATE + RETRY
 # ============================================================
 
-async def get_rate():
+async def get_verified_rate():
 
     delays = [2, 5, 10]
 
@@ -169,14 +336,19 @@ async def get_rate():
 
         try:
 
+            logger.info(
+                "💱 Rate verification %s/3",
+                attempt,
+            )
+
             return await asyncio.to_thread(
-                get_usd_eur_sync
+                get_verified_rate_sync
             )
 
         except Exception as e:
 
             logger.warning(
-                "Rate attempt %s/3 failed: %s",
+                "Rate verification failed %s/3: %s",
                 attempt,
                 e,
             )
@@ -188,7 +360,7 @@ async def get_rate():
                 )
 
     raise RuntimeError(
-        "Live FX rate unavailable"
+        "Could not verify FX rate"
     )
 
 
@@ -268,8 +440,7 @@ async def send_safe(
             )
 
             logger.critical(
-                "Another instance is using "
-                "this BOT_TOKEN."
+                "Another instance is using BOT_TOKEN."
             )
 
             return False
@@ -295,35 +466,42 @@ async def send_price(
 ):
 
     logger.info(
-        "========== PRICE UPDATE =========="
+        "========== FX UPDATE =========="
     )
 
     try:
 
-        usd_eur, eur_usd, source, updated = (
-            await get_rate()
+        usd_eur, eur_usd = (
+            await get_verified_rate()
+        )
+
+        text = make_message(
+            usd_eur,
+            eur_usd,
         )
 
         await send_safe(
             context,
             GROUP_ID,
-            make_message(
-                usd_eur,
-                eur_usd,
-            ),
+            text,
         )
 
         logger.info(
-            "✅ PRICE SENT | SOURCE=%s",
-            source,
+            "✅ VERIFIED PRICE SENT"
         )
 
     except Exception as e:
 
-        logger.exception(
-            "❌ PRICE UPDATE FAILED: %s",
+        # مهم:
+        # لا نرسل سعرًا إذا فشل التحقق
+        logger.error(
+            "❌ PRICE NOT SENT: %s",
             e,
         )
+
+    logger.info(
+        "================================"
+    )
 
 
 # ============================================================
@@ -338,7 +516,7 @@ async def start(
     await update.message.reply_text(
         "🤖 LEX Bot خدام\n"
         "💱 USD / EUR\n"
-        "📊 Live FX rate\n"
+        "📊 Verified Forex Rate\n"
         "⏰ تحديث كل 15 دقيقة\n"
         "By LEX"
     )
@@ -355,8 +533,8 @@ async def price(
 
     try:
 
-        usd_eur, eur_usd, source, updated = (
-            await get_rate()
+        usd_eur, eur_usd = (
+            await get_verified_rate()
         )
 
         await update.message.reply_text(
@@ -366,22 +544,16 @@ async def price(
             )
         )
 
-        logger.info(
-            "/price OK | SOURCE=%s | UPDATED=%s",
-            source,
-            updated,
-        )
-
     except Exception as e:
 
-        logger.exception(
+        logger.error(
             "/price failed: %s",
             e,
         )
 
         await update.message.reply_text(
             "❌ السعر غير متوفر حاليا.\n"
-            "عاود بعد شوية."
+            "المصدران لم يعطيا سعرًا متوافقًا."
         )
 
 
@@ -399,18 +571,17 @@ async def error_handler(
     if isinstance(error, Conflict):
 
         logger.critical(
-            "🚨 409 CONFLICT"
+            "🚨 TELEGRAM 409 CONFLICT"
         )
 
         logger.critical(
-            "Only ONE instance can use "
-            "this BOT_TOKEN."
+            "Only ONE instance can use BOT_TOKEN."
         )
 
         return
 
     logger.exception(
-        "Telegram error: %s",
+        "Telegram application error: %s",
         error,
     )
 
@@ -422,15 +593,18 @@ async def error_handler(
 def main():
 
     if not BOT_TOKEN:
-
         raise RuntimeError(
             "BOT_TOKEN missing"
         )
 
     if not GROUP_ID:
-
         raise RuntimeError(
             "GROUP_ID missing"
+        )
+
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError(
+            "TWELVE_DATA_API_KEY missing"
         )
 
     logger.info(
@@ -438,11 +612,19 @@ def main():
     )
 
     logger.info(
-        "🚀 LEX PRO Currency Bot"
+        "🚀 LEX PRO FOREX BOT"
     )
 
     logger.info(
-        "📊 Intraday FX source"
+        "1️⃣ Twelve Data"
+    )
+
+    logger.info(
+        "2️⃣ ExchangeRate.dev"
+    )
+
+    logger.info(
+        "🔐 Double verification enabled"
     )
 
     logger.info(
@@ -492,7 +674,7 @@ def main():
     )
 
     logger.info(
-        "▶️ Starting Telegram polling..."
+        "▶️ Telegram polling started"
     )
 
     app.run_polling(
