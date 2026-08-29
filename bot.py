@@ -1,6 +1,8 @@
 import os
 import asyncio
 import logging
+from decimal import Decimal, InvalidOperation
+
 import requests
 
 from telegram import Update
@@ -24,18 +26,14 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
 
-# API يمكن تغييره من Environment بدون تعديل الكود
-# الافتراضي: Frankfurter
-API_URL = os.getenv(
-    "API_URL",
-    "https://api.frankfurter.app/latest?from=USD&to=EUR"
-)
-
-# تحديث تلقائي كل 3 ساعات
-UPDATE_INTERVAL = 3 * 60 * 60
+# تحديث تلقائي كل 15 دقيقة
+UPDATE_INTERVAL = 15 * 60
 
 # أول تحديث بعد 10 ثواني
 FIRST_UPDATE = 10
+
+# Intraday FX API
+API_URL = "https://api.exchangerate.dev/v1/rates/USD/EUR"
 
 
 # ============================================================
@@ -63,12 +61,37 @@ session.headers.update({
 
 
 # ============================================================
-# GET LIVE RATE
+# RATE VALIDATION
 # ============================================================
 
-def get_rate_sync():
+def validate_rate(value):
+    try:
+        rate = Decimal(str(value))
 
-    logger.info("🌐 Requesting USD/EUR rate...")
+        # USD/EUR منطقي
+        if rate <= Decimal("0.50"):
+            return None
+
+        if rate >= Decimal("1.50"):
+            return None
+
+        return rate
+
+    except (
+        InvalidOperation,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+# ============================================================
+# GET USD/EUR
+# ============================================================
+
+def get_usd_eur_sync():
+
+    logger.info("🌐 Getting intraday USD/EUR rate...")
 
     response = session.get(
         API_URL,
@@ -79,51 +102,63 @@ def get_rate_sync():
 
     data = response.json()
 
-    # Frankfurter format:
-    # {
-    #   "amount": 1,
-    #   "base": "USD",
-    #   "date": "...",
-    #   "rates": {
-    #       "EUR": 0.86
-    #   }
-    # }
-
-    rates = data.get("rates")
-
-    if not isinstance(rates, dict):
-        raise RuntimeError(
-            "Invalid API response: rates missing"
-        )
-
-    if "EUR" not in rates:
-        raise RuntimeError(
-            "EUR rate missing"
-        )
-
-    usd_eur = float(rates["EUR"])
-
-    # ========================================================
-    # SAFETY CHECK
-    # ========================================================
-
-    if not 0.50 < usd_eur < 1.50:
-        raise RuntimeError(
-            f"Suspicious USD/EUR rate: {usd_eur}"
-        )
-
-    eur_usd = 1 / usd_eur
-
     logger.info(
-        "✅ Rate received: USD/EUR %.6f",
-        usd_eur,
+        "API response received"
     )
 
-    return usd_eur, eur_usd
+    # --------------------------------------------------------
+    # exchangerate.dev response
+    # --------------------------------------------------------
+
+    rate = data.get("rate")
+
+    if rate is None:
+
+        # fallback لبعض أشكال JSON
+        rates = data.get("rates")
+
+        if isinstance(rates, dict):
+            rate = rates.get("EUR")
+
+    rate = validate_rate(rate)
+
+    if rate is None:
+
+        raise RuntimeError(
+            f"Invalid USD/EUR rate: {data}"
+        )
+
+    eur_usd = Decimal("1") / rate
+
+    # --------------------------------------------------------
+    # Metadata إذا كانت موجودة
+    # --------------------------------------------------------
+
+    source = (
+        data.get("source")
+        or data.get("provider")
+        or "FX API"
+    )
+
+    updated = (
+        data.get("data_updated_at")
+        or data.get("updated_at")
+        or data.get("timestamp")
+        or ""
+    )
+
+    logger.info(
+        "✅ USD/EUR = %s | source=%s | updated=%s",
+        rate,
+        source,
+        updated,
+    )
+
+    return rate, eur_usd, source, updated
 
 
 # ============================================================
-# ASYNC RATE WITH RETRIES
+# ASYNC RATE + RETRY
 # ============================================================
 
 async def get_rate():
@@ -135,7 +170,7 @@ async def get_rate():
         try:
 
             return await asyncio.to_thread(
-                get_rate_sync
+                get_usd_eur_sync
             )
 
         except Exception as e:
@@ -147,12 +182,13 @@ async def get_rate():
             )
 
             if attempt < 3:
+
                 await asyncio.sleep(
                     delays[attempt - 1]
                 )
 
     raise RuntimeError(
-        "Unable to obtain live rate"
+        "Live FX rate unavailable"
     )
 
 
@@ -176,8 +212,8 @@ def make_message(
 # TELEGRAM SEND
 # ============================================================
 
-async def send_message_safe(
-    context: ContextTypes.DEFAULT_TYPE,
+async def send_safe(
+    context,
     chat_id,
     text,
 ):
@@ -200,7 +236,7 @@ async def send_message_safe(
         except RetryAfter as e:
 
             logger.warning(
-                "Telegram rate limit: waiting %s seconds",
+                "Telegram rate limit: %s sec",
                 e.retry_after,
             )
 
@@ -232,7 +268,7 @@ async def send_message_safe(
             )
 
             logger.critical(
-                "Another process is using "
+                "Another instance is using "
                 "this BOT_TOKEN."
             )
 
@@ -251,7 +287,7 @@ async def send_message_safe(
 
 
 # ============================================================
-# AUTOMATIC PRICE UPDATE
+# AUTOMATIC UPDATE
 # ============================================================
 
 async def send_price(
@@ -264,29 +300,30 @@ async def send_price(
 
     try:
 
-        usd_eur, eur_usd = await get_rate()
-
-        text = make_message(
-            usd_eur,
-            eur_usd,
+        usd_eur, eur_usd, source, updated = (
+            await get_rate()
         )
 
-        await send_message_safe(
+        await send_safe(
             context,
             GROUP_ID,
-            text,
+            make_message(
+                usd_eur,
+                eur_usd,
+            ),
+        )
+
+        logger.info(
+            "✅ PRICE SENT | SOURCE=%s",
+            source,
         )
 
     except Exception as e:
 
         logger.exception(
-            "❌ Price update failed: %s",
+            "❌ PRICE UPDATE FAILED: %s",
             e,
         )
-
-    logger.info(
-        "=================================="
-    )
 
 
 # ============================================================
@@ -301,8 +338,8 @@ async def start(
     await update.message.reply_text(
         "🤖 LEX Bot خدام\n"
         "💱 USD / EUR\n"
-        "📊 Live exchange rate\n"
-        "⏰ تحديث كل 3 ساعات\n"
+        "📊 Live FX rate\n"
+        "⏰ تحديث كل 15 دقيقة\n"
         "By LEX"
     )
 
@@ -318,13 +355,21 @@ async def price(
 
     try:
 
-        usd_eur, eur_usd = await get_rate()
+        usd_eur, eur_usd, source, updated = (
+            await get_rate()
+        )
 
         await update.message.reply_text(
             make_message(
                 usd_eur,
                 eur_usd,
             )
+        )
+
+        logger.info(
+            "/price OK | SOURCE=%s | UPDATED=%s",
+            source,
+            updated,
         )
 
     except Exception as e:
@@ -345,7 +390,7 @@ async def price(
 # ============================================================
 
 async def error_handler(
-    update: object,
+    update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
@@ -393,16 +438,15 @@ def main():
     )
 
     logger.info(
-        "🚀 LEX Currency Bot starting"
+        "🚀 LEX PRO Currency Bot"
     )
 
     logger.info(
-        "API: %s",
-        API_URL,
+        "📊 Intraday FX source"
     )
 
     logger.info(
-        "Update interval: 3 hours"
+        "⏰ Update every 15 minutes"
     )
 
     logger.info(
@@ -419,7 +463,6 @@ def main():
         .build()
     )
 
-    # Commands
     app.add_handler(
         CommandHandler(
             "start",
@@ -434,12 +477,10 @@ def main():
         )
     )
 
-    # Errors
     app.add_error_handler(
         error_handler
     )
 
-    # Automatic updates
     app.job_queue.run_repeating(
         send_price,
         interval=UPDATE_INTERVAL,
@@ -459,10 +500,6 @@ def main():
         allowed_updates=Update.ALL_TYPES,
     )
 
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
     main()
