@@ -4,7 +4,12 @@ import logging
 import requests
 
 from telegram import Update
-from telegram.error import Conflict, NetworkError, TimedOut, RetryAfter
+from telegram.error import (
+    Conflict,
+    NetworkError,
+    TimedOut,
+    RetryAfter,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,14 +24,18 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
 
-# تحديث كل 3 ساعات
+# API يمكن تغييره من Environment بدون تعديل الكود
+# الافتراضي: Frankfurter
+API_URL = os.getenv(
+    "API_URL",
+    "https://api.frankfurter.app/latest?from=USD&to=EUR"
+)
+
+# تحديث تلقائي كل 3 ساعات
 UPDATE_INTERVAL = 3 * 60 * 60
 
 # أول تحديث بعد 10 ثواني
 FIRST_UPDATE = 10
-
-# JSON exchange-rate API
-API_URL = "https://api.exchangerate.dev/v1/latest/USD"
 
 
 # ============================================================
@@ -42,16 +51,27 @@ logger = logging.getLogger("LEX")
 
 
 # ============================================================
-# GET RATE
+# HTTP SESSION
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": "LEX-Currency-Bot/1.0",
+    "Accept": "application/json",
+})
+
+
+# ============================================================
+# GET LIVE RATE
 # ============================================================
 
 def get_rate_sync():
 
-    response = requests.get(
+    logger.info("🌐 Requesting USD/EUR rate...")
+
+    response = session.get(
         API_URL,
-        params={
-            "symbols": "EUR",
-        },
         timeout=(5, 15),
     )
 
@@ -59,37 +79,52 @@ def get_rate_sync():
 
     data = response.json()
 
-    if data.get("error"):
-        raise RuntimeError(
-            f"API error: {data['error']}"
-        )
+    # Frankfurter format:
+    # {
+    #   "amount": 1,
+    #   "base": "USD",
+    #   "date": "...",
+    #   "rates": {
+    #       "EUR": 0.86
+    #   }
+    # }
 
     rates = data.get("rates")
 
     if not isinstance(rates, dict):
-        raise RuntimeError("Invalid API response")
+        raise RuntimeError(
+            "Invalid API response: rates missing"
+        )
 
     if "EUR" not in rates:
-        raise RuntimeError("EUR rate missing")
+        raise RuntimeError(
+            "EUR rate missing"
+        )
 
     usd_eur = float(rates["EUR"])
 
-    # حماية من رقم غير منطقي
-    if not 0.1 < usd_eur < 2:
+    # ========================================================
+    # SAFETY CHECK
+    # ========================================================
+
+    if not 0.50 < usd_eur < 1.50:
         raise RuntimeError(
-            f"Invalid USD/EUR rate: {usd_eur}"
+            f"Suspicious USD/EUR rate: {usd_eur}"
         )
 
     eur_usd = 1 / usd_eur
 
     logger.info(
-        "💱 USD/EUR = %.6f | EUR/USD = %.6f",
+        "✅ Rate received: USD/EUR %.6f",
         usd_eur,
-        eur_usd,
     )
 
     return usd_eur, eur_usd
 
+
+# ============================================================
+# ASYNC RATE WITH RETRIES
+# ============================================================
 
 async def get_rate():
 
@@ -117,7 +152,7 @@ async def get_rate():
                 )
 
     raise RuntimeError(
-        "Could not get exchange rate"
+        "Unable to obtain live rate"
     )
 
 
@@ -125,7 +160,10 @@ async def get_rate():
 # MESSAGE
 # ============================================================
 
-def make_message(usd_eur, eur_usd):
+def make_message(
+    usd_eur,
+    eur_usd,
+):
 
     return (
         f"🇺🇸 1 USD = {usd_eur:.6f} EUR\n"
@@ -135,10 +173,14 @@ def make_message(usd_eur, eur_usd):
 
 
 # ============================================================
-# SAFE TELEGRAM SEND
+# TELEGRAM SEND
 # ============================================================
 
-async def send_safe(context, chat_id, text):
+async def send_message_safe(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id,
+    text,
+):
 
     for attempt in range(1, 4):
 
@@ -158,7 +200,7 @@ async def send_safe(context, chat_id, text):
         except RetryAfter as e:
 
             logger.warning(
-                "Telegram rate limit: %s sec",
+                "Telegram rate limit: waiting %s seconds",
                 e.retry_after,
             )
 
@@ -178,6 +220,7 @@ async def send_safe(context, chat_id, text):
             )
 
             if attempt < 3:
+
                 await asyncio.sleep(
                     attempt * 3
                 )
@@ -208,7 +251,7 @@ async def send_safe(context, chat_id, text):
 
 
 # ============================================================
-# AUTOMATIC UPDATE
+# AUTOMATIC PRICE UPDATE
 # ============================================================
 
 async def send_price(
@@ -223,13 +266,15 @@ async def send_price(
 
         usd_eur, eur_usd = await get_rate()
 
-        await send_safe(
+        text = make_message(
+            usd_eur,
+            eur_usd,
+        )
+
+        await send_message_safe(
             context,
             GROUP_ID,
-            make_message(
-                usd_eur,
-                eur_usd,
-            ),
+            text,
         )
 
     except Exception as e:
@@ -256,8 +301,8 @@ async def start(
     await update.message.reply_text(
         "🤖 LEX Bot خدام\n"
         "💱 USD / EUR\n"
-        "📊 Exchange rate\n"
-        "⏰ تحديث تلقائي كل 3 ساعات\n"
+        "📊 Live exchange rate\n"
+        "⏰ تحديث كل 3 ساعات\n"
         "By LEX"
     )
 
@@ -300,7 +345,7 @@ async def price(
 # ============================================================
 
 async def error_handler(
-    update,
+    update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
@@ -332,17 +377,36 @@ async def error_handler(
 def main():
 
     if not BOT_TOKEN:
+
         raise RuntimeError(
             "BOT_TOKEN missing"
         )
 
     if not GROUP_ID:
+
         raise RuntimeError(
             "GROUP_ID missing"
         )
 
     logger.info(
-        "🚀 Starting LEX Currency Bot"
+        "======================================"
+    )
+
+    logger.info(
+        "🚀 LEX Currency Bot starting"
+    )
+
+    logger.info(
+        "API: %s",
+        API_URL,
+    )
+
+    logger.info(
+        "Update interval: 3 hours"
+    )
+
+    logger.info(
+        "======================================"
     )
 
     app = (
@@ -355,6 +419,7 @@ def main():
         .build()
     )
 
+    # Commands
     app.add_handler(
         CommandHandler(
             "start",
@@ -369,10 +434,12 @@ def main():
         )
     )
 
+    # Errors
     app.add_error_handler(
         error_handler
     )
 
+    # Automatic updates
     app.job_queue.run_repeating(
         send_price,
         interval=UPDATE_INTERVAL,
@@ -380,11 +447,7 @@ def main():
     )
 
     logger.info(
-        "✅ LEX Bot initialized"
-    )
-
-    logger.info(
-        "⏰ Automatic update every 3 hours"
+        "✅ Bot initialized"
     )
 
     logger.info(
@@ -396,6 +459,10 @@ def main():
         allowed_updates=Update.ALL_TYPES,
     )
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main() 
