@@ -1,2 +1,2 @@
-python-telegram-bot[job-queue]
-requests
+python-telegram-bot[job-queue]>=22,<23
+requests>=2.31,<3
