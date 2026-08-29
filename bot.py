@@ -25,17 +25,23 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
-API_KEY = os.getenv("CURRENCYFREAKS_API_KEY")
 
-# نشر السعر كل 3 ساعات
+# API key اختياري:
+# يشتغل exchangerate.dev بدون key للتجربة.
+# إذا عندك Free API Key حطو في Render.
+EXCHANGERATE_API_KEY = os.getenv(
+    "EXCHANGERATE_API_KEY"
+)
+
+# تحديث البوت كل 3 ساعات
 UPDATE_INTERVAL = 3 * 60 * 60
 
-# أول نشر بعد 10 ثواني
+# أول تحديث بعد 10 ثواني
 FIRST_UPDATE = 10
 
-# CurrencyFreaks API
+# exchangerate.dev
 API_URL = (
-    "https://api.currencyfreaks.com/v2.0/rates/latest"
+    "https://api.exchangerate.dev/v1/latest/USD"
 )
 
 CACHE_FILE = "last_rate.json"
@@ -65,7 +71,7 @@ logger = logging.getLogger("LEX")
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "LEX-Currency-Bot/3.0",
+    "User-Agent": "LEX-Currency-Bot/4.0",
     "Accept": "application/json",
 })
 
@@ -77,7 +83,9 @@ session.headers.update({
 def save_cache(
     usd_eur,
     eur_usd,
-    api_date=None,
+    timestamp_api=None,
+    source=None,
+    market_session=None,
 ):
 
     try:
@@ -85,8 +93,10 @@ def save_cache(
         data = {
             "usd_eur": usd_eur,
             "eur_usd": eur_usd,
-            "api_date": api_date,
-            "timestamp": int(time.time()),
+            "api_timestamp": timestamp_api,
+            "source": source,
+            "market_session": market_session,
+            "saved_at": int(time.time()),
         }
 
         with open(
@@ -133,12 +143,20 @@ def load_cache():
             data["eur_usd"]
         )
 
-        timestamp = int(
-            data["timestamp"]
+        saved_at = int(
+            data["saved_at"]
         )
 
-        api_date = data.get(
-            "api_date"
+        source = data.get(
+            "source"
+        )
+
+        market_session = data.get(
+            "market_session"
+        )
+
+        api_timestamp = data.get(
+            "api_timestamp"
         )
 
         if usd_eur <= 0:
@@ -150,8 +168,10 @@ def load_cache():
         return (
             usd_eur,
             eur_usd,
-            api_date,
-            timestamp,
+            api_timestamp,
+            source,
+            market_session,
+            saved_at,
         )
 
     except Exception as e:
@@ -174,7 +194,7 @@ def validate_rate(value):
 
         value = float(value)
 
-        # Basic sanity check
+        # USD/EUR منطقيًا لازم يكون داخل هذا النطاق
         if not (
             0.1 < value < 2.0
         ):
@@ -191,25 +211,25 @@ def validate_rate(value):
 
 
 # ============================================================
-# CURRENCYFREAKS
+# GET LIVE RATE
 # ============================================================
 
-def get_currencyfreaks_rate():
-
-    if not API_KEY:
-
-        raise RuntimeError(
-            "CURRENCYFREAKS_API_KEY missing"
-        )
+def get_live_rate():
 
     logger.info(
-        "🌐 Requesting CurrencyFreaks..."
+        "🌐 Requesting exchangerate.dev..."
     )
 
     params = {
-        "apikey": API_KEY,
         "symbols": "EUR",
     }
+
+    # إذا عندنا API key نستعمله
+    if EXCHANGERATE_API_KEY:
+
+        params["apikey"] = (
+            EXCHANGERATE_API_KEY
+        )
 
     response = session.get(
         API_URL,
@@ -222,22 +242,21 @@ def get_currencyfreaks_rate():
     data = response.json()
 
     logger.info(
-        "CurrencyFreaks response received"
+        "Exchange API response received"
     )
 
     # ========================================================
-    # CHECK API ERROR
+    # API ERROR
     # ========================================================
 
-    if "error" in data:
+    if data.get("error"):
 
         raise RuntimeError(
-            f"CurrencyFreaks API error: "
-            f"{data['error']}"
+            f"API error: {data['error']}"
         )
 
     # ========================================================
-    # CHECK STRUCTURE
+    # RATES
     # ========================================================
 
     rates = data.get(
@@ -250,7 +269,8 @@ def get_currencyfreaks_rate():
     ):
 
         raise RuntimeError(
-            "Invalid API response: rates missing"
+            "Invalid API response: "
+            "rates missing"
         )
 
     if "EUR" not in rates:
@@ -279,15 +299,24 @@ def get_currencyfreaks_rate():
 
     eur_usd = 1 / usd_eur
 
-    api_date = data.get(
-        "date"
+    # ========================================================
+    # METADATA
+    # ========================================================
+
+    api_timestamp = data.get(
+        "timestamp"
     )
 
-    # Save valid rate
-    save_cache(
-        usd_eur,
-        eur_usd,
-        api_date,
+    source = data.get(
+        "source"
+    )
+
+    market_session = data.get(
+        "market_session"
+    )
+
+    logger.info(
+        "======================================"
     )
 
     logger.info(
@@ -296,25 +325,55 @@ def get_currencyfreaks_rate():
     )
 
     logger.info(
-        "📅 API date = %s",
-        api_date,
+        "✅ EUR/USD = %.9f",
+        eur_usd,
+    )
+
+    logger.info(
+        "📡 SOURCE = %s",
+        source,
+    )
+
+    logger.info(
+        "📊 MARKET SESSION = %s",
+        market_session,
+    )
+
+    logger.info(
+        "🕐 API TIMESTAMP = %s",
+        api_timestamp,
+    )
+
+    logger.info(
+        "======================================"
+    )
+
+    # Save valid rate
+    save_cache(
+        usd_eur,
+        eur_usd,
+        api_timestamp,
+        source,
+        market_session,
     )
 
     return (
         usd_eur,
         eur_usd,
         "LIVE",
-        api_date,
+        api_timestamp,
+        source,
+        market_session,
     )
 
 
 # ============================================================
-# ASYNC RATE + RETRY
+# ASYNC RATE WITH RETRY
 # ============================================================
 
 async def get_rate():
 
-    delays = [
+    retry_delays = [
         2,
         5,
         10,
@@ -330,7 +389,7 @@ async def get_rate():
             )
 
             result = await asyncio.to_thread(
-                get_currencyfreaks_rate
+                get_live_rate
             )
 
             return result
@@ -346,7 +405,7 @@ async def get_rate():
             if attempt < 3:
 
                 await asyncio.sleep(
-                    delays[
+                    retry_delays[
                         attempt - 1
                     ]
                 )
@@ -362,17 +421,19 @@ async def get_rate():
         (
             usd_eur,
             eur_usd,
-            api_date,
-            timestamp,
+            api_timestamp,
+            source,
+            market_session,
+            saved_at,
         ) = cached
 
         age = (
             int(time.time())
-            - timestamp
+            - saved_at
         )
 
         logger.warning(
-            "⚠️ API unavailable."
+            "⚠️ Live API unavailable."
         )
 
         logger.warning(
@@ -388,12 +449,14 @@ async def get_rate():
             usd_eur,
             eur_usd,
             "CACHE",
-            api_date,
+            api_timestamp,
+            source,
+            market_session,
         )
 
     raise RuntimeError(
-        "CurrencyFreaks unavailable "
-        "and no cache exists"
+        "Live API unavailable "
+        "and no cached rate exists"
     )
 
 
@@ -414,7 +477,7 @@ def make_message(
 
 
 # ============================================================
-# TELEGRAM SEND
+# TELEGRAM SAFE SEND
 # ============================================================
 
 async def send_message_safe(
@@ -475,8 +538,8 @@ async def send_message_safe(
             )
 
             logger.error(
-                "Another instance is using "
-                "this BOT_TOKEN."
+                "Another instance is "
+                "using this BOT_TOKEN."
             )
 
             return False
@@ -494,7 +557,7 @@ async def send_message_safe(
 
 
 # ============================================================
-# AUTOMATIC UPDATE
+# AUTOMATIC PRICE
 # ============================================================
 
 async def send_price(
@@ -510,8 +573,10 @@ async def send_price(
         (
             usd_eur,
             eur_usd,
+            source_type,
+            api_timestamp,
             source,
-            api_date,
+            market_session,
         ) = await get_rate()
 
         message = make_message(
@@ -528,13 +593,27 @@ async def send_price(
         if success:
 
             logger.info(
-                "✅ PRICE SENT | "
-                "USD/EUR %.6f | "
-                "SOURCE %s | "
-                "DATE %s",
+                "✅ PRICE SENT"
+            )
+
+            logger.info(
+                "USD/EUR = %.6f",
                 usd_eur,
+            )
+
+            logger.info(
+                "TYPE = %s",
+                source_type,
+            )
+
+            logger.info(
+                "SOURCE = %s",
                 source,
-                api_date,
+            )
+
+            logger.info(
+                "SESSION = %s",
+                market_session,
             )
 
     except Exception as e:
@@ -544,9 +623,11 @@ async def send_price(
             e,
         )
 
-    logger.info(
-        "================================="
-    )
+    finally:
+
+        logger.info(
+            "================================="
+        )
 
 
 # ============================================================
@@ -576,13 +657,19 @@ async def price(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    logger.info(
+        "📊 /price command received"
+    )
+
     try:
 
         (
             usd_eur,
             eur_usd,
+            source_type,
+            api_timestamp,
             source,
-            api_date,
+            market_session,
         ) = await get_rate()
 
         await update.message.reply_text(
@@ -593,10 +680,7 @@ async def price(
         )
 
         logger.info(
-            "/price successful | "
-            "SOURCE=%s | DATE=%s",
-            source,
-            api_date,
+            "✅ /price successful"
         )
 
     except Exception as e:
@@ -613,7 +697,7 @@ async def price(
 
 
 # ============================================================
-# ERROR HANDLER
+# TELEGRAM ERROR HANDLER
 # ============================================================
 
 async def error_handler(
@@ -633,8 +717,8 @@ async def error_handler(
         )
 
         logger.error(
-            "Only ONE bot instance "
-            "can run."
+            "Only ONE instance can "
+            "use this bot token."
         )
 
         return
@@ -646,7 +730,7 @@ async def error_handler(
 
 
 # ============================================================
-# RUN BOT
+# RUN
 # ============================================================
 
 def run_bot():
@@ -663,15 +747,21 @@ def run_bot():
             "GROUP_ID missing"
         )
 
-    if not API_KEY:
-
-        raise RuntimeError(
-            "CURRENCYFREAKS_API_KEY missing"
-        )
-
     logger.info(
         "🚀 Starting LEX Currency Bot"
     )
+
+    if EXCHANGERATE_API_KEY:
+
+        logger.info(
+            "🔑 exchangerate.dev API key enabled"
+        )
+
+    else:
+
+        logger.info(
+            "🔓 exchangerate.dev anonymous mode"
+        )
 
     app = (
         Application.builder()
@@ -683,6 +773,7 @@ def run_bot():
         .build()
     )
 
+    # Commands
     app.add_handler(
         CommandHandler(
             "start",
@@ -697,6 +788,7 @@ def run_bot():
         )
     )
 
+    # Error handler
     app.add_error_handler(
         error_handler
     )
@@ -714,6 +806,10 @@ def run_bot():
 
     logger.info(
         "⏰ Automatic update every 3 hours"
+    )
+
+    logger.info(
+        "🔄 First update after 10 seconds"
     )
 
     app.run_polling(
@@ -755,11 +851,9 @@ def main():
             )
 
             logger.error(
-                "Another bot instance "
-                "is using this token."
+                "Stop the other bot instance."
             )
 
-            # لا تعيد التشغيل بلا نهاية
             break
 
         except Exception as e:
