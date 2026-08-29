@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import time
 import asyncio
@@ -27,18 +26,23 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
 
+# تحديث كل 3 ساعات
 UPDATE_INTERVAL = 3 * 60 * 60
+
+# أول تحديث بعد 10 ثواني
 FIRST_UPDATE = 10
 
-XE_CONVERTER_URL = (
-    "https://www.xe.com/currencyconverter/"
-    "?Amount=1&From=USD&To=EUR"
+# Frankfurter API - JSON مباشر
+FRANKFURTER_URL = (
+    "https://api.frankfurter.dev/v2/rate/USD/EUR"
 )
 
-XE_TABLE_URL = (
-    "https://www.xe.com/currencytables/"
-)
+# نطلب ECB فقط
+FRANKFURTER_PARAMS = {
+    "providers": "ECB"
+}
 
+# تخزين آخر سعر صحيح
 CACHE_FILE = "last_rate.json"
 
 
@@ -66,18 +70,8 @@ logger = logging.getLogger("LEX")
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 "
-        "(Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/128.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": "LEX-Currency-Bot/1.0",
+    "Accept": "application/json",
 })
 
 
@@ -86,34 +80,44 @@ session.headers.update({
 # ============================================================
 
 def save_cache(usd_eur, eur_usd):
-
-    data = {
-        "usd_eur": usd_eur,
-        "eur_usd": eur_usd,
-        "timestamp": int(time.time()),
-    }
+    """
+    Save the last valid rate locally.
+    """
 
     try:
+        data = {
+            "usd_eur": usd_eur,
+            "eur_usd": eur_usd,
+            "timestamp": int(time.time()),
+        }
+
         with open(
             CACHE_FILE,
             "w",
             encoding="utf-8",
-        ) as f:
+        ) as file:
 
             json.dump(
                 data,
-                f,
+                file,
             )
+
+        logger.info(
+            "💾 Rate saved to cache"
+        )
 
     except Exception as e:
 
         logger.warning(
-            "Could not save cache: %s",
+            "Cache save failed: %s",
             e,
         )
 
 
 def load_cache():
+    """
+    Load last valid rate.
+    """
 
     try:
 
@@ -126,9 +130,9 @@ def load_cache():
             CACHE_FILE,
             "r",
             encoding="utf-8",
-        ) as f:
+        ) as file:
 
-            data = json.load(f)
+            data = json.load(file)
 
         usd_eur = float(
             data["usd_eur"]
@@ -142,7 +146,10 @@ def load_cache():
             data["timestamp"]
         )
 
-        if usd_eur <= 0 or eur_usd <= 0:
+        if usd_eur <= 0:
+            return None
+
+        if eur_usd <= 0:
             return None
 
         return (
@@ -154,7 +161,7 @@ def load_cache():
     except Exception as e:
 
         logger.warning(
-            "Could not load cache: %s",
+            "Cache load failed: %s",
             e,
         )
 
@@ -166,12 +173,17 @@ def load_cache():
 # ============================================================
 
 def validate_rate(rate):
+    """
+    Basic protection against bad API data.
+    """
 
     try:
 
         rate = float(rate)
 
-        if not (0.1 < rate < 2):
+        # USD/EUR should realistically be between
+        # these limits.
+        if not (0.1 < rate < 2.0):
             return None
 
         return rate
@@ -185,284 +197,90 @@ def validate_rate(rate):
 
 
 # ============================================================
-# METHOD 1
-# XE CONVERTER - STRUCTURED DATA
+# FRANKFURTER JSON
 # ============================================================
 
-def get_rate_from_converter():
+def get_frankfurter_rate():
+    """
+    Get USD -> EUR directly from Frankfurter JSON API.
+    No API key required.
+    """
+
+    logger.info(
+        "🌐 Requesting Frankfurter JSON..."
+    )
 
     response = session.get(
-        XE_CONVERTER_URL,
-        timeout=(5, 15),
+        FRANKFURTER_URL,
+        params=FRANKFURTER_PARAMS,
+        timeout=(5, 10),
     )
 
     response.raise_for_status()
 
-    html = response.text
+    # JSON مباشرة
+    data = response.json()
 
-    # --------------------------------------------------------
-    # Look for JSON / structured data containing EUR value
-    # --------------------------------------------------------
+    logger.info(
+        "Frankfurter response: %s",
+        data,
+    )
 
-    patterns = [
+    # Expected:
+    #
+    # {
+    #   "date": "2026-...",
+    #   "base": "USD",
+    #   "quote": "EUR",
+    #   "rate": 0.xxxx
+    # }
 
-        # Common JSON-style representations
-        r'"EUR"\s*:\s*([0-9]+\.[0-9]+)',
-
-        r'"toCurrency"\s*:\s*"EUR".{0,500}?'
-        r'"rate"\s*:\s*([0-9]+\.[0-9]+)',
-
-        r'"rate"\s*:\s*([0-9]+\.[0-9]+).{0,500}?'
-        r'"EUR"',
-
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            html,
-            re.IGNORECASE | re.DOTALL,
+    if "rate" not in data:
+        raise RuntimeError(
+            "Frankfurter JSON has no rate"
         )
 
-        if match:
+    usd_eur = validate_rate(
+        data["rate"]
+    )
 
-            rate = validate_rate(
-                match.group(1)
-            )
-
-            if rate:
-
-                logger.info(
-                    "XE converter rate found: %.9f",
-                    rate,
-                )
-
-                return rate
-
-    # --------------------------------------------------------
-    # Fallback: extract converter numeric value
-    # --------------------------------------------------------
-
-    fallback_patterns = [
-
-        r'1\.00\s*USD\s*=\s*'
-        r'([0-9]+\.[0-9]+)\s*EUR',
-
-        r'1\s*USD\s*=\s*'
-        r'([0-9]+\.[0-9]+)\s*EUR',
-
-    ]
-
-    for pattern in fallback_patterns:
-
-        match = re.search(
-            pattern,
-            html,
-            re.IGNORECASE,
+    if usd_eur is None:
+        raise RuntimeError(
+            "Invalid USD/EUR rate"
         )
 
-        if match:
+    eur_usd = 1 / usd_eur
 
-            rate = validate_rate(
-                match.group(1)
-            )
+    save_cache(
+        usd_eur,
+        eur_usd,
+    )
 
-            if rate:
+    logger.info(
+        "✅ Frankfurter rate: %.9f",
+        usd_eur,
+    )
 
-                logger.info(
-                    "XE converter fallback rate: %.9f",
-                    rate,
-                )
-
-                return rate
-
-    raise RuntimeError(
-        "XE converter rate not found"
+    return (
+        usd_eur,
+        eur_usd,
+        "ECB",
+        data.get("date"),
     )
 
 
 # ============================================================
-# METHOD 2
-# XE CURRENCY TABLES
-# ============================================================
-
-def get_rate_from_table():
-
-    response = session.get(
-        XE_TABLE_URL,
-        timeout=(5, 15),
-    )
-
-    response.raise_for_status()
-
-    html = response.text
-
-    # EUR / USD = 1.xxxxx
-    patterns = [
-
-        r'EUR\s*/\s*USD'
-        r'.{0,300}?'
-        r'([0-9]+\.[0-9]+)',
-
-        r'USD\s*/\s*EUR'
-        r'.{0,300}?'
-        r'([0-9]+\.[0-9]+)',
-
-    ]
-
-    for index, pattern in enumerate(
-        patterns
-    ):
-
-        match = re.search(
-            pattern,
-            html,
-            re.IGNORECASE | re.DOTALL,
-        )
-
-        if not match:
-            continue
-
-        value = validate_rate(
-            match.group(1)
-        )
-
-        if not value:
-            continue
-
-        if index == 0:
-            # EUR/USD -> inverse
-            eur_usd = value
-            usd_eur = 1 / eur_usd
-
-        else:
-            # USD/EUR
-            usd_eur = value
-            eur_usd = 1 / usd_eur
-
-        logger.info(
-            "XE table rate found: %.9f",
-            usd_eur,
-        )
-
-        return (
-            usd_eur,
-            eur_usd,
-        )
-
-    raise RuntimeError(
-        "XE table rate not found"
-    )
-
-
-# ============================================================
-# MAIN RATE FUNCTION
-# ============================================================
-
-def get_xe_rate():
-
-    # --------------------------------------------------------
-    # METHOD 1
-    # --------------------------------------------------------
-
-    try:
-
-        usd_eur = (
-            get_rate_from_converter()
-        )
-
-        eur_usd = 1 / usd_eur
-
-        save_cache(
-            usd_eur,
-            eur_usd,
-        )
-
-        return (
-            usd_eur,
-            eur_usd,
-            "LIVE",
-        )
-
-    except Exception as e:
-
-        logger.warning(
-            "Converter method failed: %s",
-            e,
-        )
-
-
-    # --------------------------------------------------------
-    # METHOD 2
-    # --------------------------------------------------------
-
-    try:
-
-        usd_eur, eur_usd = (
-            get_rate_from_table()
-        )
-
-        save_cache(
-            usd_eur,
-            eur_usd,
-        )
-
-        return (
-            usd_eur,
-            eur_usd,
-            "LIVE",
-        )
-
-    except Exception as e:
-
-        logger.warning(
-            "Table method failed: %s",
-            e,
-        )
-
-
-    # --------------------------------------------------------
-    # METHOD 3 - CACHE
-    # --------------------------------------------------------
-
-    cached = load_cache()
-
-    if cached:
-
-        usd_eur, eur_usd, timestamp = (
-            cached
-        )
-
-        age = (
-            int(time.time())
-            - timestamp
-        )
-
-        logger.warning(
-            "Using cached XE rate. Age: %s seconds",
-            age,
-        )
-
-        return (
-            usd_eur,
-            eur_usd,
-            "CACHED",
-        )
-
-
-    raise RuntimeError(
-        "XE unavailable and no cached rate"
-    )
-
-
-# ============================================================
-# ASYNC RATE + RETRY
+# ASYNC RATE WITH RETRY
 # ============================================================
 
 async def get_rate():
+    """
+    Try Frankfurter 3 times.
+    If API is temporarily unavailable,
+    use the last valid cached rate.
+    """
 
-    delays = [
+    retry_delays = [
         2,
         5,
         10,
@@ -473,16 +291,12 @@ async def get_rate():
         try:
 
             logger.info(
-                "Getting XE rate %s/3",
+                "💱 Rate attempt %s/3",
                 attempt,
             )
 
             result = await asyncio.to_thread(
-                get_xe_rate
-            )
-
-            logger.info(
-                "XE rate obtained successfully"
+                get_frankfurter_rate
             )
 
             return result
@@ -490,7 +304,7 @@ async def get_rate():
         except Exception as e:
 
             logger.warning(
-                "XE attempt %s failed: %s",
+                "❌ Attempt %s failed: %s",
                 attempt,
                 e,
             )
@@ -498,11 +312,49 @@ async def get_rate():
             if attempt < 3:
 
                 await asyncio.sleep(
-                    delays[attempt - 1]
+                    retry_delays[
+                        attempt - 1
+                    ]
                 )
 
+    # ========================================================
+    # CACHE FALLBACK
+    # ========================================================
+
+    cached = load_cache()
+
+    if cached:
+
+        (
+            usd_eur,
+            eur_usd,
+            timestamp,
+        ) = cached
+
+        age = (
+            int(time.time())
+            - timestamp
+        )
+
+        logger.warning(
+            "⚠️ Frankfurter unavailable."
+        )
+
+        logger.warning(
+            "Using cached rate. Age: %s seconds",
+            age,
+        )
+
+        return (
+            usd_eur,
+            eur_usd,
+            "CACHE",
+            None,
+        )
+
     raise RuntimeError(
-        "XE failed after 3 attempts"
+        "Frankfurter unavailable "
+        "and no cached rate"
     )
 
 
@@ -526,7 +378,7 @@ def make_message(
 # TELEGRAM SEND WITH RETRY
 # ============================================================
 
-async def send_telegram(
+async def send_message_safe(
     context,
     chat_id,
     text,
@@ -542,7 +394,7 @@ async def send_telegram(
             )
 
             logger.info(
-                "Telegram message sent"
+                "✅ Telegram message sent"
             )
 
             return True
@@ -550,7 +402,7 @@ async def send_telegram(
         except RetryAfter as e:
 
             logger.warning(
-                "Telegram rate limit: %s sec",
+                "Telegram rate limit: %s seconds",
                 e.retry_after,
             )
 
@@ -579,8 +431,12 @@ async def send_telegram(
         except Conflict:
 
             logger.error(
-                "🚨 CONFLICT: another bot "
-                "instance is using this token!"
+                "🚨 409 CONFLICT!"
+            )
+
+            logger.error(
+                "Another instance is using "
+                "this BOT_TOKEN."
             )
 
             return False
@@ -588,7 +444,7 @@ async def send_telegram(
         except Exception as e:
 
             logger.exception(
-                "Telegram send error: %s",
+                "Telegram send failed: %s",
                 e,
             )
 
@@ -606,21 +462,24 @@ async def send_price(
 ):
 
     logger.info(
-        "========== PRICE UPDATE =========="
+        "========== PRICE UPDATE START =========="
     )
 
     try:
 
-        usd_eur, eur_usd, source = (
-            await get_rate()
-        )
+        (
+            usd_eur,
+            eur_usd,
+            source,
+            rate_date,
+        ) = await get_rate()
 
         message = make_message(
             usd_eur,
             eur_usd,
         )
 
-        success = await send_telegram(
+        success = await send_message_safe(
             context,
             GROUP_ID,
             message,
@@ -629,11 +488,25 @@ async def send_price(
         if success:
 
             logger.info(
-                "✅ PRICE SENT | "
-                "USD/EUR %.6f | SOURCE %s",
+                "✅ PRICE SENT"
+            )
+
+            logger.info(
+                "USD/EUR: %.6f",
                 usd_eur,
+            )
+
+            logger.info(
+                "SOURCE: %s",
                 source,
             )
+
+            if rate_date:
+
+                logger.info(
+                    "RATE DATE: %s",
+                    rate_date,
+                )
 
     except Exception as e:
 
@@ -642,9 +515,11 @@ async def send_price(
             e,
         )
 
-    logger.info(
-        "=================================="
-    )
+    finally:
+
+        logger.info(
+            "========== PRICE UPDATE END =========="
+        )
 
 
 # ============================================================
@@ -660,6 +535,7 @@ async def start(
         "🤖 LEX Bot خدام\n"
         "💱 USD / EUR\n"
         "⏰ تحديث كل 3 ساعات\n"
+        "📊 ECB Reference Rate\n"
         "By LEX"
     )
 
@@ -673,11 +549,18 @@ async def price(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    logger.info(
+        "📊 /price command received"
+    )
+
     try:
 
-        usd_eur, eur_usd, source = (
-            await get_rate()
-        )
+        (
+            usd_eur,
+            eur_usd,
+            source,
+            rate_date,
+        ) = await get_rate()
 
         await update.message.reply_text(
             make_message(
@@ -687,14 +570,14 @@ async def price(
         )
 
         logger.info(
-            "/price successful | SOURCE %s",
+            "✅ /price successful | SOURCE=%s",
             source,
         )
 
     except Exception as e:
 
         logger.exception(
-            "/price failed: %s",
+            "❌ /price failed: %s",
             e,
         )
 
@@ -720,8 +603,11 @@ async def error_handler(
     ):
 
         logger.error(
-            "🚨 409 CONFLICT - "
-            "another instance is running"
+            "🚨 409 CONFLICT"
+        )
+
+        logger.error(
+            "Only ONE bot instance can run."
         )
 
         return
@@ -733,7 +619,7 @@ async def error_handler(
 
 
 # ============================================================
-# RUN
+# RUN BOT
 # ============================================================
 
 def run_bot():
@@ -749,7 +635,7 @@ def run_bot():
         )
 
     logger.info(
-        "🚀 Starting LEX Bot"
+        "🚀 Starting LEX Currency Bot"
     )
 
     app = (
@@ -762,6 +648,7 @@ def run_bot():
         .build()
     )
 
+    # Commands
     app.add_handler(
         CommandHandler(
             "start",
@@ -776,10 +663,12 @@ def run_bot():
         )
     )
 
+    # Error handler
     app.add_error_handler(
         error_handler
     )
 
+    # Automatic update
     app.job_queue.run_repeating(
         send_price,
         interval=UPDATE_INTERVAL,
@@ -791,9 +680,14 @@ def run_bot():
     )
 
     logger.info(
-        "⏰ Updates every 3 hours"
+        "⏰ Update every 3 hours"
     )
 
+    logger.info(
+        "🔄 First update after 10 seconds"
+    )
+
+    # Start Telegram polling
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
@@ -813,7 +707,7 @@ def main():
             run_bot()
 
             logger.warning(
-                "Bot stopped."
+                "⚠️ Bot stopped."
             )
 
             break
@@ -821,7 +715,7 @@ def main():
         except KeyboardInterrupt:
 
             logger.info(
-                "Bot stopped manually."
+                "🛑 Bot stopped manually."
             )
 
             break
@@ -829,22 +723,21 @@ def main():
         except Conflict:
 
             logger.error(
-                "🚨 409 CONFLICT detected."
+                "🚨 409 CONFLICT"
             )
 
             logger.error(
-                "Stop every other instance "
+                "Stop all other instances "
                 "using this BOT_TOKEN."
             )
 
-            # لا نعيد التشغيل بسرعة
-            # لأن هذا لن يحل Conflict
+            # Don't restart aggressively.
             time.sleep(30)
 
         except Exception as e:
 
             logger.exception(
-                "🔥 Fatal error: %s",
+                "🔥 Fatal bot error: %s",
                 e,
             )
 
@@ -860,4 +753,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+    main() 
