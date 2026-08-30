@@ -29,15 +29,21 @@ GROUP_ID = os.getenv("GROUP_ID")
 # Twelve Data API key
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
+# ============================================================
 # تحديث كل 3 ساعات
+# ============================================================
+
 UPDATE_INTERVAL = 3 * 60 * 60
 
 # أول تحديث بعد 10 ثواني
 FIRST_UPDATE = 10
 
-# أقصى فرق مسموح بين المصدرين
-# 0.0025 = 0.25%
-MAX_SOURCE_DIFFERENCE = Decimal("0.0025")
+# ============================================================
+# أقصى فرق بين المصدرين
+# 0.005 = 0.50%
+# ============================================================
+
+MAX_SOURCE_DIFFERENCE = Decimal("0.005")
 
 
 # ============================================================
@@ -59,7 +65,7 @@ logger = logging.getLogger("LEX")
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "LEX-FX-Bot/2.0",
+    "User-Agent": "LEX-FX-Bot/3.0",
     "Accept": "application/json",
 })
 
@@ -69,10 +75,12 @@ session.headers.update({
 # ============================================================
 
 def validate_rate(value):
+
     try:
+
         rate = Decimal(str(value))
 
-        # USD/EUR يجب أن يكون في نطاق منطقي
+        # USD/EUR أو EUR/USD يجب أن يكون في نطاق منطقي
         if rate <= Decimal("0.50"):
             return None
 
@@ -86,6 +94,7 @@ def validate_rate(value):
         TypeError,
         ValueError,
     ):
+
         return None
 
 
@@ -96,6 +105,7 @@ def validate_rate(value):
 def get_twelve_data():
 
     if not TWELVE_DATA_API_KEY:
+
         raise RuntimeError(
             "TWELVE_DATA_API_KEY missing"
         )
@@ -123,6 +133,7 @@ def get_twelve_data():
 
     # API error
     if data.get("status") == "error":
+
         raise RuntimeError(
             data.get(
                 "message",
@@ -133,6 +144,7 @@ def get_twelve_data():
     price = data.get("price")
 
     if price is None:
+
         raise RuntimeError(
             f"Twelve Data price missing: {data}"
         )
@@ -141,11 +153,12 @@ def get_twelve_data():
     eur_usd = validate_rate(price)
 
     if eur_usd is None:
+
         raise RuntimeError(
-            f"Invalid EUR/USD: {price}"
+            f"Invalid Twelve Data EUR/USD: {price}"
         )
 
-    # نحول إلى USD/EUR
+    # تحويل EUR/USD إلى USD/EUR
     usd_eur = Decimal("1") / eur_usd
 
     logger.info(
@@ -191,6 +204,7 @@ def get_exchangerate_dev():
     data = response.json()
 
     if data.get("result") != "success":
+
         raise RuntimeError(
             f"ExchangeRate.dev error: {data}"
         )
@@ -198,6 +212,7 @@ def get_exchangerate_dev():
     rates = data.get("rates")
 
     if not isinstance(rates, dict):
+
         raise RuntimeError(
             "ExchangeRate.dev rates missing"
         )
@@ -207,35 +222,14 @@ def get_exchangerate_dev():
     usd_eur = validate_rate(value)
 
     if usd_eur is None:
+
         raise RuntimeError(
             f"Invalid ExchangeRate.dev USD/EUR: {value}"
         )
 
-    source = data.get(
-        "source",
-        "unknown"
-    )
-
-    market_session = data.get(
-        "market_session",
-        "unknown"
-    )
-
-    timestamp = data.get(
-        "data_updated_at",
-        data.get("timestamp", "")
-    )
-
     logger.info(
         "✅ ExchangeRate.dev USD/EUR = %.8f",
         usd_eur,
-    )
-
-    logger.info(
-        "Source=%s | Session=%s | Updated=%s",
-        source,
-        market_session,
-        timestamp,
     )
 
     return usd_eur
@@ -247,21 +241,99 @@ def get_exchangerate_dev():
 
 def get_verified_rate_sync():
 
-    # --------------------------------------------------------
+    twelve_rate = None
+    second_rate = None
+
+    twelve_error = None
+    second_error = None
+
+    # ========================================================
     # SOURCE 1
-    # --------------------------------------------------------
+    # ========================================================
 
-    twelve_rate = get_twelve_data()
+    try:
 
-    # --------------------------------------------------------
+        twelve_rate = get_twelve_data()
+
+    except Exception as e:
+
+        twelve_error = str(e)
+
+        logger.error(
+            "❌ Twelve Data failed: %s",
+            e,
+        )
+
+    # ========================================================
     # SOURCE 2
-    # --------------------------------------------------------
+    # ========================================================
 
-    second_rate = get_exchangerate_dev()
+    try:
 
-    # --------------------------------------------------------
-    # Calculate difference
-    # --------------------------------------------------------
+        second_rate = get_exchangerate_dev()
+
+    except Exception as e:
+
+        second_error = str(e)
+
+        logger.error(
+            "❌ ExchangeRate.dev failed: %s",
+            e,
+        )
+
+    # ========================================================
+    # BOTH FAILED
+    # ========================================================
+
+    if twelve_rate is None and second_rate is None:
+
+        raise RuntimeError(
+            "Both FX sources failed | "
+            f"Twelve={twelve_error} | "
+            f"ExchangeRate={second_error}"
+        )
+
+    # ========================================================
+    # ONLY TWELVE DATA
+    # ========================================================
+
+    if twelve_rate is not None and second_rate is None:
+
+        logger.warning(
+            "⚠️ ExchangeRate.dev unavailable"
+        )
+
+        logger.warning(
+            "⚠️ Using Twelve Data only"
+        )
+
+        return (
+            twelve_rate,
+            Decimal("1") / twelve_rate,
+        )
+
+    # ========================================================
+    # ONLY EXCHANGERATE.DEV
+    # ========================================================
+
+    if twelve_rate is None and second_rate is not None:
+
+        logger.warning(
+            "⚠️ Twelve Data unavailable"
+        )
+
+        logger.warning(
+            "⚠️ Using ExchangeRate.dev only"
+        )
+
+        return (
+            second_rate,
+            Decimal("1") / second_rate,
+        )
+
+    # ========================================================
+    # BOTH AVAILABLE
+    # ========================================================
 
     difference = abs(
         twelve_rate - second_rate
@@ -276,23 +348,23 @@ def get_verified_rate_sync():
     )
 
     logger.info(
-        "📊 Source 1: %.8f",
+        "📊 Twelve Data      = %.8f",
         twelve_rate,
     )
 
     logger.info(
-        "📊 Source 2: %.8f",
+        "📊 ExchangeRate.dev = %.8f",
         second_rate,
     )
 
     logger.info(
-        "📊 Difference: %.4f%%",
+        "📊 Difference       = %.4f%%",
         relative_difference * 100,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # SAFETY CHECK
-    # --------------------------------------------------------
+    # ========================================================
 
     if relative_difference > MAX_SOURCE_DIFFERENCE:
 
@@ -301,15 +373,13 @@ def get_verified_rate_sync():
             f"{relative_difference * 100:.4f}%"
         )
 
-    # --------------------------------------------------------
-    # Use midpoint between both sources
-    # --------------------------------------------------------
+    # ========================================================
+    # VERIFIED PRICE
+    # ========================================================
 
     usd_eur = average
 
-    eur_usd = (
-        Decimal("1") / usd_eur
-    )
+    eur_usd = Decimal("1") / usd_eur
 
     logger.info(
         "🎯 VERIFIED USD/EUR = %.8f",
@@ -348,7 +418,7 @@ async def get_verified_rate():
         except Exception as e:
 
             logger.warning(
-                "Rate verification failed %s/3: %s",
+                "⚠️ Verification failed %s/3: %s",
                 attempt,
                 e,
             )
@@ -408,7 +478,7 @@ async def send_safe(
         except RetryAfter as e:
 
             logger.warning(
-                "Telegram rate limit: %s sec",
+                "⏳ Telegram rate limit: %s sec",
                 e.retry_after,
             )
 
@@ -422,7 +492,7 @@ async def send_safe(
         ) as e:
 
             logger.warning(
-                "Telegram network error %s/3: %s",
+                "🌐 Telegram network error %s/3: %s",
                 attempt,
                 e,
             )
@@ -436,7 +506,7 @@ async def send_safe(
         except Conflict:
 
             logger.critical(
-                "🚨 409 CONFLICT"
+                "🚨 TELEGRAM 409 CONFLICT"
             )
 
             logger.critical(
@@ -448,7 +518,7 @@ async def send_safe(
         except Exception as e:
 
             logger.exception(
-                "Telegram send error: %s",
+                "❌ Telegram send error: %s",
                 e,
             )
 
@@ -480,20 +550,26 @@ async def send_price(
             eur_usd,
         )
 
-        await send_safe(
+        success = await send_safe(
             context,
             GROUP_ID,
             text,
         )
 
-        logger.info(
-            "✅ VERIFIED PRICE SENT"
-        )
+        if success:
+
+            logger.info(
+                "✅ VERIFIED PRICE SENT"
+            )
+
+        else:
+
+            logger.error(
+                "❌ PRICE NOT SENT"
+            )
 
     except Exception as e:
 
-        # مهم:
-        # لا نرسل سعرًا إذا فشل التحقق
         logger.error(
             "❌ PRICE NOT SENT: %s",
             e,
@@ -516,8 +592,8 @@ async def start(
     await update.message.reply_text(
         "🤖 LEX Bot خدام\n"
         "💱 USD / EUR\n"
-        "📊 Verified Forex Rate\n"
-        "⏰ تحديث كل 15 دقيقة\n"
+        "📊 Double Verified Forex Rate\n"
+        "⏰ تحديث كل 3 ساعات\n"
         "By LEX"
     )
 
@@ -553,7 +629,7 @@ async def price(
 
         await update.message.reply_text(
             "❌ السعر غير متوفر حاليا.\n"
-            "المصدران لم يعطيا سعرًا متوافقًا."
+            "تعذر الحصول على سعر موثوق."
         )
 
 
@@ -593,16 +669,19 @@ async def error_handler(
 def main():
 
     if not BOT_TOKEN:
+
         raise RuntimeError(
             "BOT_TOKEN missing"
         )
 
     if not GROUP_ID:
+
         raise RuntimeError(
             "GROUP_ID missing"
         )
 
     if not TWELVE_DATA_API_KEY:
+
         raise RuntimeError(
             "TWELVE_DATA_API_KEY missing"
         )
@@ -628,7 +707,7 @@ def main():
     )
 
     logger.info(
-        "⏰ Update every 15 minutes"
+        "⏰ Update every 3 hours"
     )
 
     logger.info(
@@ -645,6 +724,10 @@ def main():
         .build()
     )
 
+    # ========================================================
+    # COMMANDS
+    # ========================================================
+
     app.add_handler(
         CommandHandler(
             "start",
@@ -659,9 +742,17 @@ def main():
         )
     )
 
+    # ========================================================
+    # ERROR HANDLER
+    # ========================================================
+
     app.add_error_handler(
         error_handler
     )
+
+    # ========================================================
+    # AUTOMATIC JOB
+    # ========================================================
 
     app.job_queue.run_repeating(
         send_price,
@@ -674,8 +765,16 @@ def main():
     )
 
     logger.info(
+        "⏰ Next automatic update in 3 hours"
+    )
+
+    logger.info(
         "▶️ Telegram polling started"
     )
+
+    # ========================================================
+    # POLLING
+    # ========================================================
 
     app.run_polling(
         drop_pending_updates=True,
@@ -683,5 +782,9 @@ def main():
     )
 
 
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
-    main()
+    main() 
