@@ -29,8 +29,8 @@ GROUP_ID = os.getenv("GROUP_ID")
 # Twelve Data API key
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-# تحديث كل 15 دقيقة
-UPDATE_INTERVAL = 15 * 60
+# تحديث كل 3 ساعات
+UPDATE_INTERVAL = 3 * 60 * 60
 
 # أول تحديث بعد 10 ثواني
 FIRST_UPDATE = 10
